@@ -7,6 +7,12 @@ use std::path::{Path, PathBuf};
 
 pub const ASSETS_DIR: &str = "assets";
 
+pub fn bundled(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .fold(root.to_path_buf(), |path, part| path.join(part))
+}
+
 pub struct Context<'a> {
     pub manifest: &'a Manifest,
     pub cartridge_dir: PathBuf,
@@ -22,7 +28,7 @@ impl Context<'_> {
             .asset(id)
             .ok_or_else(|| format!("asset \"{id}\" is not declared"))?;
         match &asset.file {
-            Some(file) => Ok(self.cartridge_dir.join(file)),
+            Some(file) => Ok(bundled(&self.cartridge_dir, file)),
             None => Ok(self.data_dir.join(ASSETS_DIR).join(id)),
         }
     }
@@ -85,7 +91,7 @@ impl Context<'_> {
             .map(|arg| self.expand(arg))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(LaunchSpec {
-            program: self.cartridge_dir.join(run),
+            program: bundled(&self.cartridge_dir, run),
             args,
             cwd: self.data_dir.clone(),
             envs: Vec::new(),
@@ -144,7 +150,7 @@ type = "bool"
         ]);
         let context = Context {
             manifest: &manifest,
-            cartridge_dir: root().join("store/abc"),
+            cartridge_dir: root().join("store").join("abc"),
             data_dir: root().join("data"),
             platform: Platform::LinuxX86_64,
             settings: &settings,
@@ -155,12 +161,15 @@ type = "bool"
         );
         assert_eq!(context.expand("${setting:flag}").unwrap(), "true");
         let setup = context.program(StepKind::Setup).unwrap().unwrap();
-        assert_eq!(setup.program, root().join("store/abc").join("files/main"));
+        assert_eq!(
+            setup.program,
+            root().join("store").join("abc").join("files").join("main")
+        );
         assert_eq!(setup.cwd, root().join("data"));
         assert_eq!(setup.args[0], "setup");
         assert_eq!(
             PathBuf::from(&setup.args[1]),
-            root().join("store/abc").join("files/b.bin")
+            root().join("store").join("abc").join("files").join("b.bin")
         );
         assert_eq!(setup.args[3], "linux-x86_64");
         assert!(context.program(StepKind::Service).unwrap().is_none());
