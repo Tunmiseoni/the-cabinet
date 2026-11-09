@@ -116,6 +116,10 @@ impl Supervised {
             .wait_timeout(crate::constants::SUPERVISOR_REAP_TIMEOUT)
     }
 
+    pub fn wait_blocking(&self, timeout: Duration) -> Option<Exit> {
+        self.exit.wait_timeout(timeout)
+    }
+
     pub fn send_line(&self, line: &str) -> bool {
         match &*self.stdin.lock_or_recover() {
             Some(sender) => sender.send(line.to_string()).is_ok(),
