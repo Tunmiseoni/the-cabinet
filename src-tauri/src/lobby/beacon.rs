@@ -9,6 +9,8 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 const ROOM_PATH: &str = "/room";
 
+pub(crate) type Handler = Arc<dyn Fn(Request) + Send + Sync>;
+
 pub(crate) fn bind_addresses(tailnet: Option<Ipv4Addr>) -> Vec<IpAddr> {
     let mut addresses = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
     if let Some(address) = tailnet.filter(|address| !address.is_loopback()) {
@@ -29,13 +31,25 @@ impl Beacon {
         port: u16,
         room: Arc<Mutex<Room>>,
     ) -> crate::error::Result<Self> {
+        Self::serve(
+            addresses,
+            port,
+            Arc::new(move |request| respond(request, &room)),
+        )
+    }
+
+    pub(crate) fn serve(
+        addresses: &[IpAddr],
+        port: u16,
+        handler: Handler,
+    ) -> crate::error::Result<Self> {
         let beacon = Self {
             servers: Vec::new(),
             stop: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
         };
         addresses.iter().try_fold(beacon, |mut beacon, address| {
-            beacon.listen(SocketAddr::new(*address, port), Arc::clone(&room))?;
+            beacon.listen(SocketAddr::new(*address, port), Arc::clone(&handler))?;
             Ok(beacon)
         })
     }
@@ -45,14 +59,14 @@ impl Beacon {
         Self::start(&[address.ip()], address.port(), room)
     }
 
-    fn listen(&mut self, address: SocketAddr, room: Arc<Mutex<Room>>) -> crate::error::Result<()> {
+    fn listen(&mut self, address: SocketAddr, handler: Handler) -> crate::error::Result<()> {
         let server = Server::http(address)
             .map_err(|err| format!("cannot bind the room beacon on {address}: {err}"))?;
         let server = Arc::new(server);
         let thread = {
             let server = Arc::clone(&server);
             let stop = Arc::clone(&self.stop);
-            std::thread::spawn(move || serve(&server, &stop, &room))
+            std::thread::spawn(move || serve(&server, &stop, &handler))
         };
         self.servers.push(server);
         self.threads.lock_or_recover().push(thread);
@@ -85,13 +99,21 @@ impl Drop for Beacon {
     }
 }
 
-fn serve(server: &Server, stop: &AtomicBool, room: &Arc<Mutex<Room>>) {
+fn serve(server: &Server, stop: &AtomicBool, handler: &Handler) {
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         match server.recv_timeout(constants::LOBBY_BEACON_TICK) {
-            Ok(Some(request)) => respond(request, room),
+            Ok(Some(request)) => {
+                let handler = Arc::clone(handler);
+                let spawned = std::thread::Builder::new()
+                    .name("beacon-request".to_string())
+                    .spawn(move || handler(request));
+                if let Err(err) = spawned {
+                    log::warn!("cannot handle a beacon request: {err}");
+                }
+            }
             Ok(None) => {}
             Err(err) => {
                 log::warn!("beacon stopped: {err}");
