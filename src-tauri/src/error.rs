@@ -19,6 +19,8 @@ pub enum CabinetError {
     Tauri(#[from] tauri::Error),
     #[error("{0}")]
     Opener(#[from] tauri_plugin_opener::Error),
+    #[error("{0}")]
+    Cartridge(#[from] cabinet_cartridge::Error),
 }
 
 impl From<String> for CabinetError {
