@@ -12,6 +12,7 @@ use crate::contracts::LaunchSpec;
 use crate::logging::{self, LineObserver};
 use crate::sync::MutexExt;
 use std::fs::File;
+use std::future::Future;
 use std::process::Stdio;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -31,16 +32,29 @@ pub struct Exit {
 struct ExitCell {
     value: Mutex<Option<Exit>>,
     ready: Condvar,
+    notify: tokio::sync::Notify,
 }
 
 impl ExitCell {
     fn set(&self, exit: Exit) {
         *self.value.lock_or_recover() = Some(exit);
         self.ready.notify_all();
+        self.notify.notify_waiters();
     }
 
     fn get(&self) -> Option<Exit> {
         *self.value.lock_or_recover()
+    }
+
+    async fn wait(&self) -> Exit {
+        loop {
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
+            if let Some(exit) = self.get() {
+                return exit;
+            }
+            notified.await;
+        }
     }
 
     fn wait_timeout(&self, timeout: Duration) -> Option<Exit> {
@@ -71,8 +85,9 @@ impl Supervised {
         self.pid
     }
 
-    pub fn try_exit(&self) -> Option<Exit> {
-        self.exit.get()
+    pub fn exited(&self) -> impl Future<Output = Exit> + Send + 'static {
+        let exit = Arc::clone(&self.exit);
+        async move { exit.wait().await }
     }
 
     pub fn stop_blocking(&self, grace: Duration) -> Option<Exit> {

@@ -43,7 +43,19 @@ fn reports_the_exit_code() {
     let child = spawn(&spec("cmd", &["/C", "exit 3"]), None).unwrap();
     let exit = child.exit.wait_timeout(Duration::from_secs(10)).unwrap();
     assert_eq!(exit.code, Some(3));
-    assert_eq!(child.try_exit(), Some(exit));
+    assert_eq!(child.exit.get(), Some(exit));
+}
+
+#[test]
+fn exited_resolves_once_the_program_exits() {
+    #[cfg(unix)]
+    let child = spawn(&spec("sh", &["-c", "sleep 0.1; exit 4"]), None).unwrap();
+    #[cfg(windows)]
+    let child = spawn(&spec("cmd", &["/C", "exit 4"]), None).unwrap();
+    let exit = tauri::async_runtime::block_on(child.exited());
+    assert_eq!(exit.code, Some(4));
+    let again = tauri::async_runtime::block_on(child.exited());
+    assert_eq!(again, exit);
 }
 
 #[test]
@@ -80,7 +92,7 @@ fn stop_kills_a_long_running_program() {
     let child = spawn(&spec("sleep", &["30"]), None).unwrap();
     #[cfg(windows)]
     let child = spawn(&spec("ping", &["-n", "30", "127.0.0.1"]), None).unwrap();
-    assert!(child.try_exit().is_none());
+    assert!(child.exit.get().is_none());
     let started = Instant::now();
     assert!(child.stop_blocking(Duration::ZERO).is_some());
     assert!(started.elapsed() < Duration::from_secs(5));

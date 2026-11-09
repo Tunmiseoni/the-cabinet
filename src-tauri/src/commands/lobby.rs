@@ -3,14 +3,16 @@ use crate::commands::launch::{launch_match_inner, LaunchRequest};
 use crate::config::Config;
 use crate::constants;
 use crate::lobby::beacon;
-use crate::lobby::results::{self, HealthSnapshot, RoundWatcher};
+use crate::lobby::results::{self, HealthSnapshot, RomAddresses, RoundWatcher};
 use crate::lobby::room::{new_room_id, Room};
 use crate::lobby::sets::{winner_slot, SetEvent, SetMachine};
 use crate::lobby::Lobby;
 use crate::net::Node;
 use crate::providers::Role;
 use crate::session::MatchState;
+use crate::tasks;
 use serde::{Deserialize, Serialize};
+use std::ops::ControlFlow;
 use tauri::{AppHandle, Manager};
 
 const DEFAULT_FIRST_TO: u8 = 2;
@@ -225,117 +227,165 @@ fn spawn_set_runner(
         log::info!("no result addresses for {rom}; automatic rotation is off for this room");
         return;
     };
-    std::thread::spawn(move || {
-        let mut watcher = RoundWatcher::new();
-        let mut machine = SetMachine::new(first_to);
-        let mut current_slot = initial_slot;
-        let mut rotation_state = RotationState::default();
-        let mut ticks: u64 = 0;
-        loop {
-            std::thread::sleep(constants::LOBBY_SET_POLL);
-            if !session_running(&app) {
-                break;
-            }
-            let Some(lobby) = app.try_state::<Lobby>() else {
-                break;
-            };
-            let Some(room) = lobby.room() else {
-                break;
-            };
-            if room.room_id != room_id {
-                break;
-            }
-            let Some(port) = own_command_port(&app, true) else {
-                continue;
-            };
-            if ticks == 0 {
-                log::info!("set runner: watching {rom} on command port {port} ({addresses:?})");
-            }
-            // The watcher only emits inside a round the game reported live and says P2 is
-            // human-controlled, so select/continue/idle screens, a lone host's arcade play, the
-            // arcade drift after a 2P match, and the attract demo can no longer decide a round
-            // (docs/10-lobby-spike.md §6 L12/L15).
-            match results::read_snapshot(port, addresses) {
-                Ok(snapshot) => {
-                    if ticks.is_multiple_of(20) {
-                        log::info!("set runner snapshot #{ticks}: {snapshot:?}");
-                    }
-                    if let Some(outcome) = watcher.observe(snapshot) {
-                        log::info!("set runner outcome: {outcome:?}");
-                        let event = machine.observe(outcome);
-                        lobby.set_score(machine.score());
-                        if let SetEvent::SetWon(winner) = event {
-                            if let Some(slot) = winner_slot(winner) {
-                                if let Some(rotation) = lobby.announce_rotation(slot) {
-                                    log::info!(
-                                        "set won in slot {slot}; rotation {} -> {:?}",
-                                        rotation.id,
-                                        rotation.incoming
-                                    );
-                                }
+    let runner = SetRunner {
+        app: app.clone(),
+        room_id,
+        rom,
+        addresses,
+        own_nick,
+        watcher: RoundWatcher::new(),
+        machine: SetMachine::new(first_to),
+        current_slot: initial_slot,
+        rotation_state: RotationState::default(),
+        ticks: 0,
+    };
+    crate::session::spawn_task(
+        &app,
+        tasks::poll_blocking(constants::LOBBY_SET_POLL, runner, SetRunner::tick),
+    );
+}
+
+struct SetRunner {
+    app: AppHandle,
+    room_id: String,
+    rom: String,
+    addresses: RomAddresses,
+    own_nick: String,
+    watcher: RoundWatcher,
+    machine: SetMachine,
+    current_slot: Option<u8>,
+    rotation_state: RotationState,
+    ticks: u64,
+}
+
+impl SetRunner {
+    fn tick(&mut self) -> ControlFlow<()> {
+        if !session_running(&self.app) {
+            return ControlFlow::Break(());
+        }
+        let Some(lobby) = self.app.try_state::<Lobby>() else {
+            return ControlFlow::Break(());
+        };
+        let Some(room) = lobby.room() else {
+            return ControlFlow::Break(());
+        };
+        if room.room_id != self.room_id {
+            return ControlFlow::Break(());
+        }
+        let Some(port) = own_command_port(&self.app, true) else {
+            return ControlFlow::Continue(());
+        };
+        let ticks = self.ticks;
+        if ticks == 0 {
+            log::info!(
+                "set runner: watching {} on command port {port} ({:?})",
+                self.rom,
+                self.addresses
+            );
+        }
+        // The watcher only emits inside a round the game reported live and says P2 is
+        // human-controlled, so select/continue/idle screens, a lone host's arcade play, the
+        // arcade drift after a 2P match, and the attract demo can no longer decide a round
+        // (docs/10-lobby-spike.md §6 L12/L15).
+        match results::read_snapshot(port, self.addresses) {
+            Ok(snapshot) => {
+                if ticks.is_multiple_of(20) {
+                    log::info!("set runner snapshot #{ticks}: {snapshot:?}");
+                }
+                if let Some(outcome) = self.watcher.observe(snapshot) {
+                    log::info!("set runner outcome: {outcome:?}");
+                    let event = self.machine.observe(outcome);
+                    lobby.set_score(self.machine.score());
+                    if let SetEvent::SetWon(winner) = event {
+                        if let Some(slot) = winner_slot(winner) {
+                            if let Some(rotation) = lobby.announce_rotation(slot) {
+                                log::info!(
+                                    "set won in slot {slot}; rotation {} -> {:?}",
+                                    rotation.id,
+                                    rotation.incoming
+                                );
                             }
                         }
                     }
-                    // Publish whether the rotation's incoming still owes the game a coin, so the
-                    // UI can prompt them (L16). Clears as soon as the game reads the seat human.
-                    if let Some(room) = lobby.room() {
-                        let awaiting = awaiting_coin(&room, &snapshot);
-                        if awaiting != room.awaiting_coin {
-                            log::info!("awaiting coin: {awaiting:?}");
-                        }
-                        lobby.set_awaiting_coin(awaiting);
-                    }
                 }
-                Err(err) => log::debug!("set watcher read failed: {err}"),
+                // Publish whether the rotation's incoming still owes the game a coin, so the
+                // UI can prompt them (L16). Clears as soon as the game reads the seat human.
+                if let Some(room) = lobby.room() {
+                    let awaiting = awaiting_coin(&room, &snapshot);
+                    if awaiting != room.awaiting_coin {
+                        log::info!("awaiting coin: {awaiting:?}");
+                    }
+                    lobby.set_awaiting_coin(awaiting);
+                }
             }
-            if let Some(room) = lobby.room() {
-                reconcile_rotation(
-                    &mut rotation_state,
-                    &room,
-                    &own_nick,
-                    &mut current_slot,
-                    port,
-                );
-            }
-            ticks += 1;
+            Err(err) => log::debug!("set watcher read failed: {err}"),
         }
-    });
+        if let Some(room) = lobby.room() {
+            reconcile_rotation(
+                &mut self.rotation_state,
+                &room,
+                &self.own_nick,
+                &mut self.current_slot,
+                port,
+            );
+        }
+        self.ticks += 1;
+        ControlFlow::Continue(())
+    }
 }
 
 /// Joiner-side seat follower: poll the host's beacon and act on the advertised rotation, so a
 /// spectator is promoted into a freed seat and a losing player steps out without a cross-network
 /// control channel.
 fn spawn_seat_follower(app: AppHandle, host: String, own_nick: String, initial_slot: Option<u8>) {
-    std::thread::spawn(move || {
-        let mut current_slot = initial_slot;
-        let mut rotation_state = RotationState::default();
-        loop {
-            std::thread::sleep(constants::LOBBY_SEAT_POLL);
-            if !session_running(&app) {
-                break;
-            }
-            let Some(port) = own_command_port(&app, false) else {
-                continue;
-            };
-            let Ok(cfg) = load_config(&app) else {
-                continue;
-            };
-            let Some(room) = beacon::query(
-                &host,
-                beacon_port(&cfg),
-                constants::LOBBY_BEACON_QUERY_TIMEOUT,
-            ) else {
-                continue;
-            };
-            reconcile_rotation(
-                &mut rotation_state,
-                &room,
-                &own_nick,
-                &mut current_slot,
-                port,
-            );
+    let follower = SeatFollower {
+        app: app.clone(),
+        host,
+        own_nick,
+        current_slot: initial_slot,
+        rotation_state: RotationState::default(),
+    };
+    crate::session::spawn_task(
+        &app,
+        tasks::poll_blocking(constants::LOBBY_SEAT_POLL, follower, SeatFollower::tick),
+    );
+}
+
+struct SeatFollower {
+    app: AppHandle,
+    host: String,
+    own_nick: String,
+    current_slot: Option<u8>,
+    rotation_state: RotationState,
+}
+
+impl SeatFollower {
+    fn tick(&mut self) -> ControlFlow<()> {
+        if !session_running(&self.app) {
+            return ControlFlow::Break(());
         }
-    });
+        let Some(port) = own_command_port(&self.app, false) else {
+            return ControlFlow::Continue(());
+        };
+        let Ok(cfg) = load_config(&self.app) else {
+            return ControlFlow::Continue(());
+        };
+        let Some(room) = beacon::query(
+            &self.host,
+            beacon_port(&cfg),
+            constants::LOBBY_BEACON_QUERY_TIMEOUT,
+        ) else {
+            return ControlFlow::Continue(());
+        };
+        reconcile_rotation(
+            &mut self.rotation_state,
+            &room,
+            &self.own_nick,
+            &mut self.current_slot,
+            port,
+        );
+        ControlFlow::Continue(())
+    }
 }
 
 #[derive(Debug, Deserialize)]

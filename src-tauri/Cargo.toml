@@ -31,6 +31,8 @@ thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros"] }
 ureq = "3"
 tiny_http = "0.12.0"
+tokio = { version = "1", features = ["sync", "time"] }
+tokio-util = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
