@@ -6,12 +6,13 @@ use crate::net::PeerHealth;
 use crate::netplay::{NetplayConnection, NetplayInfo, NetplayTracker};
 use crate::probe;
 use crate::providers::Role;
+use crate::supervisor::{self, Capture, Supervised};
 use crate::sync::MutexExt;
 use crate::time;
 use serde::Serialize;
 use std::path::Path;
-use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const MATCH_EVENT: &str = "match-state-changed";
@@ -67,7 +68,7 @@ pub struct Plan {
 }
 
 struct Running {
-    child: Child,
+    child: Supervised,
     role: Role,
 }
 
@@ -137,49 +138,27 @@ fn spawn_child(
     plan: &Plan,
     session_dir: Option<&Path>,
     capture_netplay: bool,
-) -> crate::error::Result<Child> {
-    let mut command = crate::process::command(&plan.spec.program);
-    command
-        .args(&plan.spec.args)
-        .current_dir(&plan.spec.cwd)
-        .envs(plan.spec.envs.iter().cloned());
-    if session_dir.is_some() {
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("failed to launch {}: {err}", plan.spec.program.display()))?;
-    if let Some(dir) = session_dir {
-        match logging::open_emulator_log(dir, plan.role.key()) {
-            Ok(sink) => {
-                let label = format!("{}[{}]", plan.role.key(), plan.rom);
-                let observer = if capture_netplay {
-                    Some(netplay_observer(app, generation, plan.role))
-                } else {
+) -> crate::error::Result<Supervised> {
+    let capture =
+        session_dir.and_then(
+            |dir| match logging::open_emulator_log(dir, plan.role.key()) {
+                Ok(sink) => Some(Capture {
+                    label: format!("{}[{}]", plan.role.key(), plan.rom),
+                    sink,
+                    observer: capture_netplay.then(|| netplay_observer(app, generation, plan.role)),
+                }),
+                Err(err) => {
+                    log::warn!("cannot capture emulator output: {err}");
                     None
-                };
-                if let Some(stdout) = child.stdout.take() {
-                    logging::capture_stream(
-                        stdout,
-                        format!("{label} stdout"),
-                        sink.clone(),
-                        observer.clone(),
-                    );
                 }
-                if let Some(stderr) = child.stderr.take() {
-                    logging::capture_stream(stderr, format!("{label} stderr"), sink, observer);
-                }
-            }
-            Err(err) => log::warn!("cannot capture emulator output: {err}"),
-        }
-    }
-    Ok(child)
+            },
+        );
+    supervisor::spawn(&plan.spec, capture)
 }
 
 fn clear_running(inner: &mut SessionInner) {
-    for mut running in inner.running.drain(..) {
-        let _ = running.child.kill();
-        let _ = running.child.wait();
+    for running in inner.running.drain(..) {
+        running.child.stop_blocking(Duration::ZERO);
     }
 }
 
@@ -265,15 +244,14 @@ pub fn launch_many(
             Ok(child) => child,
             Err(err) => {
                 log::error!("{err}");
-                for mut started in running.drain(..) {
-                    let _ = started.child.kill();
-                    let _ = started.child.wait();
+                for started in running.drain(..) {
+                    started.child.stop_blocking(Duration::ZERO);
                 }
                 inner.state = MatchState::default();
                 return Err(err);
             }
         };
-        let pid = child.id();
+        let pid = child.pid();
         log::info!("spawned {} pid={}", plan.role.label(), pid);
         running.push(Running {
             child,
@@ -383,23 +361,14 @@ fn spawn_monitor(app: AppHandle, generation: u64) {
         let mut still = Vec::new();
         let mut changed = false;
 
-        for mut entry in running {
-            match entry.child.try_wait() {
-                Ok(Some(status)) => {
+        for entry in running {
+            match entry.child.try_exit() {
+                Some(exit) => {
                     changed = true;
-                    log::info!(
-                        "{} exited with code {:?}",
-                        entry.role.label(),
-                        status.code()
-                    );
-                    finish_slot(&mut inner.state, entry.role, status.code());
+                    log::info!("{} exited with code {:?}", entry.role.label(), exit.code);
+                    finish_slot(&mut inner.state, entry.role, exit.code);
                 }
-                Ok(None) => still.push(entry),
-                Err(err) => {
-                    changed = true;
-                    log::warn!("{} status error: {err}", entry.role.label());
-                    finish_slot(&mut inner.state, entry.role, None);
-                }
+                None => still.push(entry),
             }
         }
 

@@ -14,6 +14,7 @@ mod process;
 mod providers;
 mod roms;
 mod session;
+mod supervisor;
 mod sync;
 mod tailscale;
 mod time;
