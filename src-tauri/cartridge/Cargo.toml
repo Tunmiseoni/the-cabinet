@@ -1,0 +1,18 @@
+[package]
+name = "cabinet-cartridge"
+version = "0.1.0"
+description = "The Cabinet's cartridge format and the cabinet-pack tool"
+authors = ["The Cabinet contributors"]
+edition = "2021"
+publish = false
+
+[lib]
+name = "cabinet_cartridge"
+
+[dependencies]
+minisign-verify = "0.3.0"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+toml = "1.2.1"
+zip = { version = "9.5.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

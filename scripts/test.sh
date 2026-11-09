@@ -12,13 +12,13 @@ echo "==> frontend build (tsc + vite)"
 npm run build
 
 echo "==> cargo fmt"
-(cd src-tauri && cargo fmt --check)
+(cd src-tauri && cargo fmt --all --check)
 
 echo "==> cargo test"
-(cd src-tauri && cargo test)
+(cd src-tauri && cargo test --workspace)
 
 echo "==> cargo clippy"
-(cd src-tauri && cargo clippy --all-targets -- -D warnings)
+(cd src-tauri && cargo clippy --workspace --all-targets -- -D warnings)
 
 echo
 echo "All checks passed."
