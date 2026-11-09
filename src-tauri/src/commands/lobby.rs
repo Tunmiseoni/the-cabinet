@@ -12,6 +12,7 @@ use crate::providers::Role;
 use crate::session::MatchState;
 use crate::tasks;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr};
 use std::ops::ControlFlow;
 use tauri::{AppHandle, Manager};
 
@@ -33,6 +34,17 @@ fn self_node(cfg: &Config) -> Option<Node> {
     crate::net::provider(cfg)
         .ok()
         .and_then(|network| network.self_node().ok().flatten())
+}
+
+fn beacon_addresses(cfg: &Config) -> Vec<IpAddr> {
+    let tailnet = crate::net::provider(cfg)
+        .ok()
+        .and_then(|network| network.self_address())
+        .and_then(|address| address.parse::<Ipv4Addr>().ok());
+    if tailnet.is_none() {
+        log::warn!("no tailnet address: the room beacon is reachable from this machine only");
+    }
+    beacon::bind_addresses(tailnet)
 }
 
 fn host_identity(cfg: &Config) -> (String, String) {
@@ -441,7 +453,12 @@ pub fn lobby_start(
         seats.set(seat, Some(own_nick.clone()));
         room.set_seats(&seats);
     }
-    let room = lobby.start(room, beacon_port(&cfg), own_nick.clone())?;
+    let room = lobby.start(
+        room,
+        &beacon_addresses(&cfg),
+        beacon_port(&cfg),
+        own_nick.clone(),
+    )?;
 
     log::info!(
         "hosting room {} ({} first to {first_to}, host seat {host_seat:?})",
@@ -658,7 +675,14 @@ mod tests {
     fn lobby_with_seats(seats: Seats) -> Lobby {
         let lobby = Lobby::default();
         let room = Room::new("r", "node", "player-one", "sfiii3nr1", 1, None);
-        lobby.start(room, 0, "player-one".into()).unwrap();
+        lobby
+            .start(
+                room,
+                &[std::net::Ipv4Addr::LOCALHOST.into()],
+                0,
+                "player-one".into(),
+            )
+            .unwrap();
         lobby.update(|room| room.set_seats(&seats));
         lobby
     }

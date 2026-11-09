@@ -84,6 +84,14 @@ pub trait NetworkProvider: Send + Sync {
             .map(|node| node.ip)
             .filter(|ip| !ip.trim().is_empty()))
     }
+
+    fn self_address(&self) -> Option<String> {
+        self.self_node()
+            .ok()
+            .flatten()
+            .map(|node| node.ip)
+            .filter(|ip| !ip.trim().is_empty())
+    }
 }
 
 pub type SharedProvider = Arc<dyn NetworkProvider>;
@@ -183,6 +191,7 @@ mod tests {
         );
         assert_eq!(provider.address("nWIN").unwrap(), None);
         assert_eq!(provider.address("missing").unwrap(), None);
+        assert_eq!(provider.self_address().as_deref(), Some("100.64.0.1"));
     }
 
     #[test]

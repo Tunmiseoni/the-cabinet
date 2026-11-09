@@ -3,6 +3,7 @@ use super::room::Room;
 use super::sets::{plan_rotation, Rotation, Seats, SetScore};
 use crate::netplay::NetplayInfo;
 use crate::sync::MutexExt;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -21,6 +22,7 @@ impl Lobby {
     pub(crate) fn start(
         &self,
         room: Room,
+        addresses: &[IpAddr],
         port: u16,
         own_nick: String,
     ) -> crate::error::Result<Room> {
@@ -30,10 +32,12 @@ impl Lobby {
         }
         let starting = room.clone();
         let shared = Arc::new(Mutex::new(room));
-        let beacon = Beacon::start(port, Arc::clone(&shared))?;
-        if let Some(bound) = beacon.local_port() {
-            log::info!("room {} beacon listening on {bound}", starting.room_id);
-        }
+        let beacon = Beacon::start(addresses, port, Arc::clone(&shared))?;
+        log::info!(
+            "room {} beacon listening on {:?}",
+            starting.room_id,
+            beacon.local_addresses()
+        );
         *inner = Some(Live {
             room: shared,
             beacon,
@@ -130,6 +134,9 @@ impl Lobby {
 mod tests {
     use super::*;
     use crate::netplay::{NetplayInfo, NetplayPlayer};
+    use std::net::Ipv4Addr;
+
+    const LOOPBACK: [IpAddr; 1] = [IpAddr::V4(Ipv4Addr::LOCALHOST)];
 
     /// `waiting` is the connected spectators in the order they started waiting; `connections` is
     /// the same set in connection order unless a test overrides it.
@@ -154,7 +161,9 @@ mod tests {
     fn lobby_with_room() -> Lobby {
         let lobby = Lobby::default();
         let room = Room::new("r", "node", "player-one", "sfiii3nr1", 2, Some(1));
-        lobby.start(room, 0, "player-one".into()).unwrap();
+        lobby
+            .start(room, &LOOPBACK, 0, "player-one".into())
+            .unwrap();
         lobby
     }
 
@@ -222,7 +231,9 @@ mod tests {
     fn a_spectating_host_seats_joiners_one_then_two() {
         let lobby = Lobby::default();
         let room = Room::new("r", "node", "player-one", "sfiii3nr1", 2, None);
-        lobby.start(room, 0, "player-one".into()).unwrap();
+        lobby
+            .start(room, &LOOPBACK, 0, "player-one".into())
+            .unwrap();
         let room = lobby
             .observe_netplay(&info(None, &[("player-two", 1)], &["player-two"]))
             .unwrap();

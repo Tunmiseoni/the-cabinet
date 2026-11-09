@@ -1,7 +1,7 @@
 use super::room::Room;
 use crate::constants;
 use crate::sync::MutexExt;
-use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,44 +9,71 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 const ROOM_PATH: &str = "/room";
 
+pub(crate) fn bind_addresses(tailnet: Option<Ipv4Addr>) -> Vec<IpAddr> {
+    let mut addresses = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+    if let Some(address) = tailnet.filter(|address| !address.is_loopback()) {
+        addresses.push(IpAddr::V4(address));
+    }
+    addresses
+}
+
 pub(crate) struct Beacon {
-    server: Arc<Server>,
+    servers: Vec<Arc<Server>>,
     stop: Arc<AtomicBool>,
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Beacon {
-    pub(crate) fn start(port: u16, room: Arc<Mutex<Room>>) -> crate::error::Result<Self> {
-        Self::start_on((Ipv4Addr::UNSPECIFIED, port), room)
-    }
-
-    fn start_on<A: ToSocketAddrs>(
-        address: A,
+    pub(crate) fn start(
+        addresses: &[IpAddr],
+        port: u16,
         room: Arc<Mutex<Room>>,
     ) -> crate::error::Result<Self> {
-        let server =
-            Server::http(address).map_err(|err| format!("cannot bind the room beacon: {err}"))?;
-        let server = Arc::new(server);
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread = {
-            let server = Arc::clone(&server);
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || serve(&server, &stop, &room))
+        let beacon = Self {
+            servers: Vec::new(),
+            stop: Arc::new(AtomicBool::new(false)),
+            threads: Mutex::new(Vec::new()),
         };
-        Ok(Self {
-            server,
-            stop,
-            thread: Mutex::new(Some(thread)),
+        addresses.iter().try_fold(beacon, |mut beacon, address| {
+            beacon.listen(SocketAddr::new(*address, port), Arc::clone(&room))?;
+            Ok(beacon)
         })
     }
 
+    #[cfg(test)]
+    fn start_on(address: SocketAddr, room: Arc<Mutex<Room>>) -> crate::error::Result<Self> {
+        Self::start(&[address.ip()], address.port(), room)
+    }
+
+    fn listen(&mut self, address: SocketAddr, room: Arc<Mutex<Room>>) -> crate::error::Result<()> {
+        let server = Server::http(address)
+            .map_err(|err| format!("cannot bind the room beacon on {address}: {err}"))?;
+        let server = Arc::new(server);
+        let thread = {
+            let server = Arc::clone(&server);
+            let stop = Arc::clone(&self.stop);
+            std::thread::spawn(move || serve(&server, &stop, &room))
+        };
+        self.servers.push(server);
+        self.threads.lock_or_recover().push(thread);
+        Ok(())
+    }
+
+    pub(crate) fn local_addresses(&self) -> Vec<SocketAddr> {
+        self.servers
+            .iter()
+            .filter_map(|server| server.server_addr().to_ip())
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn local_port(&self) -> Option<u16> {
-        self.server.server_addr().to_ip().map(|addr| addr.port())
+        self.local_addresses().first().map(SocketAddr::port)
     }
 
     pub(crate) fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.thread.lock_or_recover().take() {
+        for handle in self.threads.lock_or_recover().drain(..) {
             let _ = handle.join();
         }
     }
@@ -121,7 +148,7 @@ mod tests {
             seats.enqueue(format!("watcher-{index}"));
         }
         room.lock_or_recover().set_seats(&seats);
-        let beacon = Beacon::start_on((Ipv4Addr::LOCALHOST, 0), Arc::clone(&room)).unwrap();
+        let beacon = Beacon::start_on((Ipv4Addr::LOCALHOST, 0).into(), Arc::clone(&room)).unwrap();
         (room, beacon)
     }
 
@@ -159,6 +186,54 @@ mod tests {
         let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = socket.local_addr().unwrap().port();
         assert!(query("127.0.0.1", port, Duration::from_millis(200)).is_none());
+    }
+
+    #[test]
+    fn binds_loopback_and_the_tailnet_address() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tailnet = Ipv4Addr::new(100, 64, 0, 1);
+        assert_eq!(bind_addresses(None), vec![loopback]);
+        assert_eq!(
+            bind_addresses(Some(tailnet)),
+            vec![loopback, IpAddr::V4(tailnet)]
+        );
+        assert_eq!(bind_addresses(Some(Ipv4Addr::LOCALHOST)), vec![loopback]);
+    }
+
+    #[test]
+    fn a_failed_bind_releases_the_listeners_already_started() {
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let room = Arc::new(Mutex::new(Room::new(
+            "r1",
+            "node-1",
+            "player-one",
+            "sfiii3nr1",
+            2,
+            None,
+        )));
+        let addresses = [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+        ];
+        let err = Beacon::start(&addresses, port, Arc::clone(&room))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("203.0.113.9"), "got {err}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let beacon = loop {
+            match Beacon::start(&addresses[..1], port, Arc::clone(&room)) {
+                Ok(beacon) => break beacon,
+                Err(err) if std::time::Instant::now() >= deadline => {
+                    panic!("port not released: {err}")
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        assert_eq!(beacon.local_port(), Some(port));
     }
 
     #[test]
