@@ -9,6 +9,10 @@ publish = false
 [lib]
 name = "cabinet_cartridge"
 
+[[bin]]
+name = "cabinet-pack"
+path = "src/bin/cabinet-pack.rs"
+
 [dependencies]
 minisign-verify = "0.3.0"
 serde = { version = "1", features = ["derive"] }
