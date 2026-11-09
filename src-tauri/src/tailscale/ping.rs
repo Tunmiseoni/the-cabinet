@@ -1,4 +1,5 @@
-use super::{cli_command, PathKind, PeerHealth};
+use super::cli_command;
+use crate::net::{PathKind, PeerHealth};
 use std::path::PathBuf;
 
 pub fn ping(binary: &PathBuf, ip: &str) -> PeerHealth {

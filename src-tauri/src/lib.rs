@@ -7,6 +7,7 @@ mod env;
 pub mod error;
 mod lobby;
 mod logging;
+mod net;
 mod netplay;
 mod probe;
 mod process;

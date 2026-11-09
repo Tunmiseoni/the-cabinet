@@ -6,55 +6,7 @@ pub use status::status;
 
 use crate::config::Config;
 use crate::process;
-use serde::Serialize;
 use std::path::PathBuf;
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Peer {
-    pub node_id: String,
-    pub hostname: String,
-    pub dns_name: String,
-    pub os: String,
-    pub ip: String,
-    pub ips: Vec<String>,
-    pub online: bool,
-    pub active: bool,
-    pub cur_addr: String,
-    pub relay: String,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
-    pub last_seen: String,
-    pub is_self: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Tailnet {
-    pub backend_state: String,
-    pub self_peer: Option<Peer>,
-    pub peers: Vec<Peer>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PathKind {
-    Direct,
-    Relay,
-    Local,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PeerHealth {
-    pub ip: String,
-    pub ok: bool,
-    pub path: PathKind,
-    pub rtt_ms: Option<f64>,
-    pub relay_code: Option<String>,
-    pub raw: String,
-}
 
 pub fn resolve_binary(cfg: &Config) -> crate::error::Result<PathBuf> {
     if let Some(custom) = cfg.tailscale_path.as_deref() {

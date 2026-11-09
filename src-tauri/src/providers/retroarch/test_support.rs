@@ -47,7 +47,7 @@ pub(super) fn provider(scratch: &Scratch) -> RetroArchProvider {
         command_port: 55355,
         nickname: Some("spike".to_string()),
         handle: None,
-        tailscale_binary: None,
+        network: None,
         overrides_dir: scratch.dir.join("cfg"),
         peer_override: Default::default(),
         mute_spectators: true,

@@ -2,11 +2,11 @@ use crate::config::{self, Config};
 use crate::constants;
 use crate::contracts::LaunchSpec;
 use crate::logging;
+use crate::net::PeerHealth;
 use crate::netplay::{NetplayConnection, NetplayInfo, NetplayTracker};
 use crate::probe;
 use crate::providers::Role;
 use crate::sync::MutexExt;
-use crate::tailscale::{self, PeerHealth};
 use crate::time;
 use serde::Serialize;
 use std::path::Path;
@@ -324,20 +324,20 @@ pub fn launch(
 
 fn spawn_health(app: AppHandle, generation: u64, ip: String) {
     std::thread::spawn(move || {
-        let binary = {
+        let network = {
             let cfg = app
                 .path()
                 .app_config_dir()
                 .map(|dir| Config::load(&config::config_path(dir)))
                 .unwrap_or_default();
-            tailscale::resolve_binary(&cfg).ok()
+            crate::net::provider(&cfg).ok()
         };
-        let Some(binary) = binary else {
+        let Some(network) = network else {
             return;
         };
 
         while running(&app, generation) {
-            let health = tailscale::ping(&binary, &ip);
+            let health = network.health(&ip);
             if !running(&app, generation) {
                 break;
             }

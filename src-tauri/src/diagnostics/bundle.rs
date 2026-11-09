@@ -2,7 +2,6 @@ use super::redact::redact;
 use crate::logging;
 use crate::providers;
 use crate::session;
-use crate::tailscale;
 use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 
@@ -71,8 +70,8 @@ pub(crate) fn diagnostics_text(app: &AppHandle) -> String {
     }
 
     let _ = writeln!(out, "\n--- tailnet ---");
-    match tailscale::resolve_binary(&cfg) {
-        Ok(binary) => match tailscale::status(&binary) {
+    match crate::net::provider(&cfg) {
+        Ok(network) => match network.status() {
             Ok(tailnet) => {
                 let online = tailnet.peers.iter().filter(|peer| peer.online).count();
                 let _ = writeln!(out, "backendState: {}", tailnet.backend_state);
