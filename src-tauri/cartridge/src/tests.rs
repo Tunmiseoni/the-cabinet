@@ -375,7 +375,7 @@ fn validates_capabilities() {
         "*.example.test",
         "localhost",
         "Example.test",
-        "1.2.3.4",
+        "203.0.113.4",
         "-a.test",
         "a..test",
     ] {
