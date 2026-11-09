@@ -21,6 +21,13 @@ pub(crate) fn os_hostname() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+pub(crate) fn instance() -> Option<String> {
+    std::env::var("CABINET_INSTANCE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)

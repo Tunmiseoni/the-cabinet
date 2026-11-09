@@ -1,7 +1,7 @@
 use crate::constants;
+use crate::net::{self, Network, PeerHealth};
 use crate::probe;
 use crate::roms::{self, RomIndex};
-use crate::tailscale::{self, PeerHealth, Tailnet};
 use std::time::Duration;
 use tauri::AppHandle;
 
@@ -13,17 +13,15 @@ pub(crate) mod lobby;
 pub(crate) use config::load_config;
 
 #[tauri::command(async)]
-pub fn list_peers(app: AppHandle) -> crate::error::CommandResult<Tailnet> {
+pub fn list_peers(app: AppHandle) -> crate::error::CommandResult<Network> {
     let cfg = load_config(&app)?;
-    let binary = tailscale::resolve_binary(&cfg)?;
-    Ok(tailscale::status(&binary)?)
+    Ok(net::provider(&cfg)?.status()?)
 }
 
 #[tauri::command(async)]
 pub fn peer_health(app: AppHandle, ip: String) -> crate::error::CommandResult<PeerHealth> {
     let cfg = load_config(&app)?;
-    let binary = tailscale::resolve_binary(&cfg)?;
-    Ok(tailscale::ping(&binary, &ip))
+    Ok(net::provider(&cfg)?.health(&ip))
 }
 
 #[tauri::command(async)]
@@ -32,8 +30,7 @@ pub fn peers_health(
     ips: Vec<String>,
 ) -> crate::error::CommandResult<Vec<PeerHealth>> {
     let cfg = load_config(&app)?;
-    let binary = tailscale::resolve_binary(&cfg)?;
-    Ok(tailscale::ping_many(&binary, &ips))
+    Ok(net::provider(&cfg)?.health_many(&ips))
 }
 
 #[tauri::command(async)]

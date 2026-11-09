@@ -31,7 +31,7 @@ pub struct RetroArchProvider {
     command_port: u16,
     nickname: Option<String>,
     handle: Option<String>,
-    tailscale_binary: Option<PathBuf>,
+    network: Option<crate::net::SharedProvider>,
     overrides_dir: PathBuf,
     peer_override: PeerOverride,
     mute_spectators: bool,
@@ -68,7 +68,7 @@ impl RetroArchProvider {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string);
-        let tailscale_binary = crate::tailscale::resolve_binary(cfg).ok();
+        let network = crate::net::provider(cfg).ok();
         let autoconfig_dir = core::resolve_autoconfig_dir(&program, home.as_deref());
         let host_config = core::resolve_host_config(&program, home.as_deref());
         let core_dir =
@@ -88,7 +88,7 @@ impl RetroArchProvider {
             },
             nickname,
             handle,
-            tailscale_binary,
+            network,
             overrides_dir: app_config_dir.join("retroarch"),
             peer_override: if dev {
                 PeerOverride::loopback()
@@ -121,9 +121,8 @@ impl RetroArchProvider {
     }
 
     fn tailnet_hostname(&self) -> Option<String> {
-        let binary = self.tailscale_binary.as_ref()?;
-        let tailnet = crate::tailscale::status(binary).ok()?;
-        let hostname = tailnet.self_peer?.hostname;
+        let network = self.network.as_ref()?;
+        let hostname = network.self_node().ok()??.hostname;
         let hostname = hostname.trim();
         (!hostname.is_empty()).then(|| hostname.to_string())
     }

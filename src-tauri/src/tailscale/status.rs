@@ -1,4 +1,5 @@
-use super::{cli_command, Peer, Tailnet};
+use super::cli_command;
+use crate::net::{Network, Node};
 use crate::sync::MutexExt;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -44,7 +45,7 @@ struct RawPeer {
 }
 
 impl RawPeer {
-    fn into_peer(self, is_self: bool, fallback_id: String) -> Peer {
+    fn into_peer(self, is_self: bool, fallback_id: String) -> Node {
         let node_id = if self.id.is_empty() {
             fallback_id
         } else {
@@ -57,7 +58,7 @@ impl RawPeer {
             .cloned()
             .or_else(|| self.ips.first().cloned())
             .unwrap_or_default();
-        Peer {
+        Node {
             node_id,
             hostname: self.hostname,
             dns_name: self.dns_name,
@@ -94,12 +95,12 @@ fn run(binary: &PathBuf, args: &[&str]) -> crate::error::Result<String> {
     Ok(stdout)
 }
 
-fn status_cache() -> &'static Mutex<Option<(PathBuf, Instant, Tailnet)>> {
-    static CACHE: OnceLock<Mutex<Option<(PathBuf, Instant, Tailnet)>>> = OnceLock::new();
+fn status_cache() -> &'static Mutex<Option<(PathBuf, Instant, Network)>> {
+    static CACHE: OnceLock<Mutex<Option<(PathBuf, Instant, Network)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-pub fn status(binary: &PathBuf) -> crate::error::Result<Tailnet> {
+pub fn status(binary: &PathBuf) -> crate::error::Result<Network> {
     if let Some((cached_binary, at, tailnet)) = status_cache().lock_or_recover().as_ref() {
         if cached_binary == binary && at.elapsed() < crate::constants::TAILSCALE_STATUS_CACHE_TTL {
             return Ok(tailnet.clone());
@@ -112,7 +113,7 @@ pub fn status(binary: &PathBuf) -> crate::error::Result<Tailnet> {
     Ok(tailnet)
 }
 
-pub fn parse_status(raw: &str) -> crate::error::Result<Tailnet> {
+pub fn parse_status(raw: &str) -> crate::error::Result<Network> {
     let parsed: RawStatus =
         serde_json::from_str(raw).map_err(|err| format!("invalid status JSON: {err}"))?;
 
@@ -120,7 +121,7 @@ pub fn parse_status(raw: &str) -> crate::error::Result<Tailnet> {
         .self_node
         .map(|node| node.into_peer(true, String::new()));
 
-    let mut peers: Vec<Peer> = parsed
+    let mut peers: Vec<Node> = parsed
         .peers
         .map(|map| {
             map.into_iter()
@@ -139,7 +140,7 @@ pub fn parse_status(raw: &str) -> crate::error::Result<Tailnet> {
             .then_with(|| a.hostname.to_lowercase().cmp(&b.hostname.to_lowercase()))
     });
 
-    Ok(Tailnet {
+    Ok(Network {
         backend_state: parsed.backend_state,
         self_peer,
         peers,

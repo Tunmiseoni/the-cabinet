@@ -7,6 +7,7 @@ use crate::lobby::results::{self, HealthSnapshot, RoundWatcher};
 use crate::lobby::room::{new_room_id, Room};
 use crate::lobby::sets::{winner_slot, SetEvent, SetMachine};
 use crate::lobby::Lobby;
+use crate::net::Node;
 use crate::providers::Role;
 use crate::session::MatchState;
 use serde::{Deserialize, Serialize};
@@ -26,15 +27,18 @@ fn beacon_port(cfg: &Config) -> u16 {
     }
 }
 
-fn host_identity(cfg: &Config) -> (String, String) {
-    let self_peer = crate::tailscale::resolve_binary(cfg)
+fn self_node(cfg: &Config) -> Option<Node> {
+    crate::net::provider(cfg)
         .ok()
-        .and_then(|binary| crate::tailscale::status(&binary).ok())
-        .and_then(|tailnet| tailnet.self_peer);
+        .and_then(|network| network.self_node().ok().flatten())
+}
+
+fn host_identity(cfg: &Config) -> (String, String) {
+    let self_peer = self_node(cfg);
     let node_id = self_peer
         .as_ref()
-        .map(|peer| peer.node_id.clone())
-        .filter(|value| !value.trim().is_empty())
+        .and_then(crate::net::local_identity)
+        .map(|identity| identity.member_id())
         .or_else(crate::env::os_hostname)
         .unwrap_or_else(|| "unknown".to_string());
     // The displayed handle is the same identity the lobby seats by, so the room and its seats agree.
@@ -46,11 +50,7 @@ fn host_identity(cfg: &Config) -> (String, String) {
 
 /// This machine's own netplay nickname — the identity the lobby keys seats by.
 fn netplay_identity(cfg: &Config) -> String {
-    let tailnet = crate::tailscale::resolve_binary(cfg)
-        .ok()
-        .and_then(|binary| crate::tailscale::status(&binary).ok())
-        .and_then(|tailnet| tailnet.self_peer)
-        .map(|peer| peer.hostname);
+    let tailnet = self_node(cfg).map(|peer| peer.hostname);
     crate::config::netplay_nickname(cfg, tailnet.as_deref())
 }
 
@@ -569,13 +569,12 @@ pub struct DiscoveredRoom {
 pub fn lobby_discover(app: AppHandle) -> crate::error::CommandResult<Vec<DiscoveredRoom>> {
     let cfg = load_config(&app)?;
     let port = beacon_port(&cfg);
-    let Ok(binary) = crate::tailscale::resolve_binary(&cfg) else {
+    let Ok(network) = crate::net::provider(&cfg) else {
         return Ok(Vec::new());
     };
-    let tailnet = crate::tailscale::status(&binary)?;
+    let peers = network.peers()?;
     let mut rooms = Vec::new();
-    for peer in tailnet
-        .peers
+    for peer in peers
         .iter()
         .filter(|peer| peer.online && !peer.is_self && !peer.ip.trim().is_empty())
     {
