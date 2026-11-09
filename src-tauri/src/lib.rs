@@ -1,3 +1,4 @@
+mod cartridge;
 mod commands;
 mod config;
 mod constants;
