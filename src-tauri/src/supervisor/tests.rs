@@ -79,10 +79,26 @@ fn captures_output_lines_into_the_sink_and_observer() {
     #[cfg(windows)]
     let child = spawn(&spec("cmd", &["/C", "echo hello"]), Some(capture)).unwrap();
     child.exit.wait_timeout(Duration::from_secs(10)).unwrap();
-    let first = lines.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(first.trim(), "hello");
+    #[cfg(unix)]
+    let expected = ["hello", "oops"];
+    #[cfg(windows)]
+    let expected = ["hello"];
+    let mut seen: Vec<String> = expected
+        .iter()
+        .map(|_| {
+            lines
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .trim()
+                .to_string()
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(seen, expected);
     let log = std::fs::read_to_string(logging::emulator_log_path(&dir, "test")).unwrap();
-    assert!(log.contains("hello"), "got {log}");
+    for line in expected {
+        assert!(log.contains(line), "got {log}");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
