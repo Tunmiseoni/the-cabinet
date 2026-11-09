@@ -161,6 +161,7 @@ fn spawn_child(
                     label: format!("{}[{}]", plan.role.key(), plan.rom),
                     sink,
                     observer: capture_netplay.then(|| netplay_observer(app, generation, plan.role)),
+                    stdout: None,
                 }),
                 Err(err) => {
                     log::warn!("cannot capture emulator output: {err}");

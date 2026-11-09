@@ -23,6 +23,7 @@ fn capture_lines(dir: &std::path::Path) -> (Capture, mpsc::Receiver<String>) {
             label: "test".to_string(),
             sink,
             observer: Some(observer),
+            stdout: None,
         },
         receiver,
     )
@@ -114,6 +115,91 @@ fn stop_kills_a_long_running_program() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
+fn stdout_lines(dir: &std::path::Path) -> (Capture, mpsc::Receiver<String>) {
+    let (mut capture, lines) = capture_lines(dir);
+    capture.stdout = capture.observer.take();
+    (capture, lines)
+}
+
+#[test]
+fn piped_stdin_reaches_the_program() {
+    let dir = scratch_dir("stdin");
+    let (capture, lines) = stdout_lines(&dir);
+    #[cfg(unix)]
+    let child = spawn_with(&spec("cat", &[]), Some(capture), Stdin::Piped).unwrap();
+    #[cfg(windows)]
+    let child = spawn_with(&spec("findstr", &["^"]), Some(capture), Stdin::Piped).unwrap();
+    assert!(child.send_line("hello"));
+    assert!(child.send_line("world"));
+    assert_eq!(
+        lines.recv_timeout(Duration::from_secs(5)).unwrap().trim(),
+        "hello"
+    );
+    assert_eq!(
+        lines.recv_timeout(Duration::from_secs(5)).unwrap().trim(),
+        "world"
+    );
+    child.close_stdin();
+    assert!(!child.send_line("late"));
+    let exit = child.exit.wait_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(exit.code, Some(0));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_inherited_stdin_takes_no_lines() {
+    #[cfg(unix)]
+    let child = spawn(&spec("sh", &["-c", "exit 0"]), None).unwrap();
+    #[cfg(windows)]
+    let child = spawn(&spec("cmd", &["/C", "exit 0"]), None).unwrap();
+    assert!(!child.send_line("ignored"));
+    child.exit.wait_timeout(Duration::from_secs(10)).unwrap();
+}
+
+#[test]
+fn the_exit_is_reported_after_the_last_output_line() {
+    for round in 0..20 {
+        let dir = scratch_dir(&format!("drain-{round}"));
+        let (capture, lines) = stdout_lines(&dir);
+        #[cfg(unix)]
+        let child = spawn(&spec("sh", &["-c", "echo first; echo last"]), Some(capture)).unwrap();
+        #[cfg(windows)]
+        let child = spawn(
+            &spec("cmd", &["/C", "echo first& echo last"]),
+            Some(capture),
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(child.exited());
+        let seen: Vec<String> = lines
+            .try_iter()
+            .map(|line| line.trim().to_string())
+            .collect();
+        assert_eq!(seen, ["first", "last"], "round {round}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn async_stop_kills_a_program_that_ignores_the_farewell() {
+    #[cfg(unix)]
+    let child = spawn_with(&spec("sleep", &["30"]), None, Stdin::Piped).unwrap();
+    #[cfg(windows)]
+    let child = spawn_with(
+        &spec("ping", &["-n", "30", "127.0.0.1"]),
+        None,
+        Stdin::Piped,
+    )
+    .unwrap();
+    let started = Instant::now();
+    let exit = tauri::async_runtime::block_on(
+        child.stop(Duration::from_millis(200), Some("{\"type\":\"stop\"}")),
+    );
+    assert!(exit.is_some());
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let again = tauri::async_runtime::block_on(child.stop(Duration::from_secs(5), None));
+    assert_eq!(again, exit);
+}
+
 #[cfg(unix)]
 mod unix_tree {
     use super::*;
@@ -186,5 +272,66 @@ mod unix_tree {
         let exit = child.stop_blocking(Duration::from_secs(5)).unwrap();
         assert_eq!(exit.code, Some(7));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn async_stop_lets_the_program_honour_the_farewell() {
+        let child = spawn_with(
+            &spec(
+                "sh",
+                &[
+                    "-c",
+                    "while read line; do [ \"$line\" = bye ] && exit 5; done",
+                ],
+            ),
+            None,
+            Stdin::Piped,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let exit = tauri::async_runtime::block_on(child.stop(Duration::from_secs(5), Some("bye")));
+        assert_eq!(exit.unwrap().code, Some(5));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn async_stop_terminates_before_it_kills() {
+        let dir = scratch_dir("term");
+        let (capture, lines) = capture_lines(&dir);
+        let child = spawn_with(
+            &spec(
+                "sh",
+                &[
+                    "-c",
+                    "trap 'exit 9' TERM; echo ready; while :; do sleep 0.05; done",
+                ],
+            ),
+            Some(capture),
+            Stdin::Piped,
+        )
+        .unwrap();
+        assert_eq!(
+            lines.recv_timeout(Duration::from_secs(5)).unwrap().trim(),
+            "ready"
+        );
+        let exit =
+            tauri::async_runtime::block_on(child.stop(Duration::from_millis(100), Some("stop")));
+        assert_eq!(exit.unwrap().code, Some(9));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn async_stop_kills_a_program_that_ignores_sigterm() {
+        let child = spawn_with(
+            &spec("sh", &["-c", "trap '' TERM; while :; do sleep 0.05; done"]),
+            None,
+            Stdin::Piped,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let exit = tauri::async_runtime::block_on(child.stop(Duration::from_millis(100), None));
+        assert_eq!(exit.unwrap().code, None);
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 }
