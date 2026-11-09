@@ -1,5 +1,5 @@
 use cabinet_cartridge::archive;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) struct Scratch(PathBuf);
@@ -19,10 +19,6 @@ impl Scratch {
 
     pub(crate) fn path(&self, relative: &str) -> PathBuf {
         self.0.join(relative)
-    }
-
-    pub(crate) fn root(&self) -> &Path {
-        &self.0
     }
 }
 

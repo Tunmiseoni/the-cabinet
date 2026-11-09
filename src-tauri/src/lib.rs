@@ -99,6 +99,7 @@ pub fn run() {
         .manage(session::Session::default())
         .manage(windowing::Host::new())
         .manage(lobby::Lobby::default())
+        .manage(commands::cartridge::Cartridges::default())
         .setup(|app| {
             use tauri::Manager;
             let dir = app.path().app_config_dir()?;
@@ -165,6 +166,17 @@ pub fn run() {
             commands::lobby::lobby_query,
             commands::lobby::lobby_discover,
             commands::lobby::lobby_join,
+            commands::cartridge::cartridge_inspect,
+            commands::cartridge::cartridge_install,
+            commands::cartridge::cartridge_list,
+            commands::cartridge::cartridge_set_settings,
+            commands::cartridge::cartridge_uninstall,
+            commands::cartridge::cartridge_host,
+            commands::cartridge::cartridge_join,
+            commands::cartridge::cartridge_start,
+            commands::cartridge::cartridge_action,
+            commands::cartridge::cartridge_stop,
+            commands::cartridge::cartridge_session,
             commands::cabinet::cabinet_status,
             commands::cabinet::cabinet_place,
             commands::cabinet::cabinet_release,
@@ -175,8 +187,13 @@ pub fn run() {
             diagnostics::collect_diagnostics,
             diagnostics::log_frontend,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                commands::cartridge::stop_on_exit(app);
+            }
+        });
 }
 
 #[cfg(test)]

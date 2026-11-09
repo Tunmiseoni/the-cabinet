@@ -45,14 +45,10 @@ fn run(args: &[String]) -> i32 {
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines().map_while(Result::ok);
-    let start: SessionStart = loop {
-        let Some(line) = lines.next() else {
-            return 10;
-        };
-        match decode::<ToProgram>(&line) {
-            Line::Message(ToProgram::SessionStart(start)) => break start,
-            _ => return 11,
-        }
+    let start: SessionStart = match lines.next().map(|line| decode::<ToProgram>(&line)) {
+        Some(Line::Message(ToProgram::SessionStart(start))) => start,
+        None => return 10,
+        Some(_) => return 11,
     };
     if has("--service") {
         say(&FromProgram::Ready {});
