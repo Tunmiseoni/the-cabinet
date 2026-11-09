@@ -14,6 +14,7 @@ pub const SUPERVISOR_TERM_GRACE: Duration = Duration::from_secs(1);
 pub const CARTRIDGE_STOP_GRACE: Duration = Duration::from_secs(5);
 pub const CARTRIDGE_SETUP_TIMEOUT: Duration = Duration::from_secs(600);
 pub const CARTRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(60);
+pub const CARTRIDGE_JOIN_ASK_TIMEOUT: Duration = Duration::from_secs(30);
 pub const ROOM_LONG_POLL: Duration = Duration::from_secs(20);
 pub const ROOM_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub const ROOM_RETRY_INTERVAL: Duration = Duration::from_secs(1);
