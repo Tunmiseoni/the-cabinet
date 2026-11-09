@@ -3,6 +3,7 @@ pub mod digest;
 pub mod error;
 pub mod manifest;
 pub mod platform;
+pub mod protocol;
 pub mod signature;
 pub mod validate;
 pub mod vars;

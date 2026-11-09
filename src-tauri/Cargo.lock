@@ -396,6 +396,7 @@ version = "0.1.0"
 dependencies = [
  "minisign-verify 0.3.0",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.20",
  "toml 1.2.1+spec-1.1.0",
