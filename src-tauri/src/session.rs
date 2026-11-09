@@ -6,10 +6,12 @@ use crate::net::PeerHealth;
 use crate::netplay::{NetplayConnection, NetplayInfo, NetplayTracker};
 use crate::probe;
 use crate::providers::Role;
-use crate::supervisor::{self, Capture, Supervised};
+use crate::supervisor::{self, Capture, Exit, Supervised};
 use crate::sync::MutexExt;
+use crate::tasks::{self, TaskTree};
 use crate::time;
 use serde::Serialize;
+use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -77,11 +79,24 @@ struct SessionInner {
     generation: u64,
     running: Vec<Running>,
     state: MatchState,
+    tasks: TaskTree,
 }
 
 #[derive(Default)]
 pub struct Session {
     inner: Mutex<SessionInner>,
+}
+
+pub fn spawn_task<F>(app: &AppHandle, task: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let session = app.state::<Session>();
+    let inner = session.inner.lock_or_recover();
+    if inner.running.is_empty() {
+        return;
+    }
+    inner.tasks.spawn(task);
 }
 
 fn emit(app: &AppHandle, state: &MatchState) {
@@ -157,6 +172,7 @@ fn spawn_child(
 }
 
 fn clear_running(inner: &mut SessionInner) {
+    inner.tasks.cancel();
     for running in inner.running.drain(..) {
         running.child.stop_blocking(Duration::ZERO);
     }
@@ -182,6 +198,7 @@ pub fn launch_many(
     let session = app.state::<Session>();
     let mut inner = session.inner.lock_or_recover();
     clear_running(&mut inner);
+    inner.tasks = TaskTree::default();
     inner.generation += 1;
     let generation = inner.generation;
 
@@ -280,15 +297,27 @@ pub fn launch_many(
         message: None,
     };
 
+    for entry in &running {
+        inner.tasks.spawn(watch_exit(
+            app.clone(),
+            generation,
+            entry.child.pid(),
+            entry.role,
+            entry.child.exited(),
+        ));
+    }
+    if !options.dev && !plans[0].peer_ip.trim().is_empty() {
+        inner.tasks.spawn(watch_health(
+            app.clone(),
+            generation,
+            plans[0].peer_ip.clone(),
+        ));
+    }
     inner.running = running;
     inner.state = state.clone();
     drop(inner);
 
     emit(app, &state);
-    spawn_monitor(app.clone(), generation);
-    if !options.dev && !plans[0].peer_ip.trim().is_empty() {
-        spawn_health(app.clone(), generation, plans[0].peer_ip.clone());
-    }
     Ok(state)
 }
 
@@ -300,44 +329,45 @@ pub fn launch(
     launch_many(app, std::slice::from_ref(plan), options)
 }
 
-fn spawn_health(app: AppHandle, generation: u64, ip: String) {
-    std::thread::spawn(move || {
-        let network = {
+async fn watch_health(app: AppHandle, generation: u64, ip: String) {
+    let network = {
+        let app = app.clone();
+        tasks::blocking(move || {
             let cfg = app
                 .path()
                 .app_config_dir()
                 .map(|dir| Config::load(&config::config_path(dir)))
                 .unwrap_or_default();
             crate::net::provider(&cfg).ok()
-        };
-        let Some(network) = network else {
-            return;
-        };
+        })
+        .await
+        .flatten()
+    };
+    let Some(network) = network else {
+        return;
+    };
 
-        while running(&app, generation) {
-            let health = network.health(&ip);
-            if !running(&app, generation) {
+    loop {
+        let health = {
+            let network = Arc::clone(&network);
+            let ip = ip.clone();
+            tasks::blocking(move || network.health(&ip)).await
+        };
+        let Some(health) = health else {
+            break;
+        };
+        let state = {
+            let session = app.state::<Session>();
+            let mut inner = session.inner.lock_or_recover();
+            if inner.generation != generation || inner.running.is_empty() {
                 break;
             }
-            let state = {
-                let session = app.state::<Session>();
-                let mut inner = session.inner.lock_or_recover();
-                if inner.generation != generation {
-                    break;
-                }
-                inner.state.peer_health = Some(health);
-                inner.state.clone()
-            };
-            emit(&app, &state);
-            std::thread::sleep(constants::HEALTH_INTERVAL);
-        }
-    });
-}
-
-fn running(app: &AppHandle, generation: u64) -> bool {
-    let session = app.state::<Session>();
-    let inner = session.inner.lock_or_recover();
-    inner.generation == generation && !inner.running.is_empty()
+            inner.state.peer_health = Some(health);
+            inner.state.clone()
+        };
+        emit(&app, &state);
+        tokio::time::sleep(constants::HEALTH_INTERVAL).await;
+    }
 }
 
 /// A hosted room exists only while its host instance runs. End it when the match ends.
@@ -347,52 +377,46 @@ fn stop_lobby(app: &AppHandle) {
     }
 }
 
-fn spawn_monitor(app: AppHandle, generation: u64) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(constants::MONITOR_INTERVAL);
+async fn watch_exit(
+    app: AppHandle,
+    generation: u64,
+    pid: u32,
+    role: Role,
+    exited: impl Future<Output = Exit>,
+) {
+    let exit = exited.await;
 
-        let session = app.state::<Session>();
-        let mut inner = session.inner.lock_or_recover();
-        if inner.generation != generation || inner.running.is_empty() {
-            break;
-        }
+    let session = app.state::<Session>();
+    let mut inner = session.inner.lock_or_recover();
+    if inner.generation != generation {
+        return;
+    }
+    let Some(index) = inner
+        .running
+        .iter()
+        .position(|entry| entry.child.pid() == pid)
+    else {
+        return;
+    };
+    inner.running.remove(index);
+    log::info!("{} exited with code {:?}", role.label(), exit.code);
+    finish_slot(&mut inner.state, role, exit.code);
 
-        let running = std::mem::take(&mut inner.running);
-        let mut still = Vec::new();
-        let mut changed = false;
+    let done = inner.running.is_empty();
+    if done && inner.state.status == "running" {
+        inner.state.status = "finished".to_string();
+        inner.state.message = Some("all instances exited".to_string());
+        log::info!("match finished: all instances exited");
+    }
+    let state = inner.state.clone();
+    let tasks = inner.tasks.clone();
+    drop(inner);
 
-        for entry in running {
-            match entry.child.try_exit() {
-                Some(exit) => {
-                    changed = true;
-                    log::info!("{} exited with code {:?}", entry.role.label(), exit.code);
-                    finish_slot(&mut inner.state, entry.role, exit.code);
-                }
-                None => still.push(entry),
-            }
-        }
-
-        inner.running = still;
-        let done = inner.running.is_empty();
-        if done && inner.state.status == "running" {
-            inner.state.status = "finished".to_string();
-            inner.state.message = Some("all instances exited".to_string());
-            log::info!("match finished: all instances exited");
-            changed = true;
-        }
-
-        let state = inner.state.clone();
-        drop(inner);
-
-        if changed {
-            emit(&app, &state);
-        }
-
-        if done {
-            stop_lobby(&app);
-            break;
-        }
-    });
+    emit(&app, &state);
+    if done {
+        stop_lobby(&app);
+        tasks.cancel();
+    }
 }
 
 fn mark_netplay_stopped(slot: &mut InstanceState) {

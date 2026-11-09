@@ -4120,6 +4120,8 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tiny_http",
+ "tokio",
+ "tokio-util",
  "ureq",
  "windows-sys 0.61.2",
 ]

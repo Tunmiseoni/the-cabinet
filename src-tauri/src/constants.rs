@@ -8,7 +8,6 @@ pub const PORT_PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(750);
 pub const PORT_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 pub const HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const HEALTH_INTERVAL: Duration = Duration::from_secs(4);
-pub const MONITOR_INTERVAL: Duration = Duration::from_millis(300);
 pub const TAILSCALE_STATUS_CACHE_TTL: Duration = Duration::from_millis(500);
 pub const SUPERVISOR_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 pub const SESSION_KEEP: usize = 20;

@@ -17,6 +17,7 @@ mod session;
 mod supervisor;
 mod sync;
 mod tailscale;
+mod tasks;
 mod time;
 mod windowing;
 
