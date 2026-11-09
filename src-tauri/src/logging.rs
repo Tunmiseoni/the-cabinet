@@ -91,7 +91,8 @@ pub fn capture_stream<R>(
     label: String,
     sink: Arc<Mutex<File>>,
     observer: Option<LineObserver>,
-) where
+) -> thread::JoinHandle<()>
+where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
@@ -110,7 +111,7 @@ pub fn capture_stream<R>(
                 observer(&line);
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
