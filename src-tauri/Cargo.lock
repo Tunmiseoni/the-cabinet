@@ -4106,6 +4106,7 @@ dependencies = [
  "accessibility-sys",
  "core-foundation 0.10.1",
  "core-graphics",
+ "libc",
  "log",
  "serde",
  "serde_json",
@@ -4120,6 +4121,7 @@ dependencies = [
  "time",
  "tiny_http",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
