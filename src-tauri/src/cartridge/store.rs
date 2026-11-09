@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub const STORE_DIR: &str = "store";
 pub const DATA_DIR: &str = "cartridges";
 pub const REGISTRY_FILE: &str = "registry.json";
+pub const FOOTPRINT_DIR: &str = "footprint";
 
 pub struct Staged {
     pub inspected: Inspected,
@@ -62,6 +63,13 @@ impl Store {
     pub fn data_dir(&self, cartridge: &CartridgeRef) -> PathBuf {
         self.root
             .join(DATA_DIR)
+            .join(&cartridge.publisher)
+            .join(&cartridge.id)
+    }
+
+    pub fn footprint_dir(&self, cartridge: &CartridgeRef) -> PathBuf {
+        self.root
+            .join(FOOTPRINT_DIR)
             .join(&cartridge.publisher)
             .join(&cartridge.id)
     }

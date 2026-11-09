@@ -77,11 +77,18 @@ pub fn open_emulator_log(
     session_dir: &std::path::Path,
     role: &str,
 ) -> crate::error::Result<Arc<Mutex<File>>> {
-    let path = emulator_log_path(session_dir, role);
+    open_log(&emulator_log_path(session_dir, role))
+}
+
+pub fn open_log(path: &Path) -> crate::error::Result<Arc<Mutex<File>>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
         .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     Ok(Arc::new(Mutex::new(file)))
 }

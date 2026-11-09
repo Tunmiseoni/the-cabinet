@@ -12,6 +12,7 @@ pub const TAILSCALE_STATUS_CACHE_TTL: Duration = Duration::from_millis(500);
 pub const SUPERVISOR_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 pub const SUPERVISOR_TERM_GRACE: Duration = Duration::from_secs(1);
 pub const CARTRIDGE_STOP_GRACE: Duration = Duration::from_secs(5);
+pub const CARTRIDGE_SETUP_TIMEOUT: Duration = Duration::from_secs(600);
 pub const SESSION_KEEP: usize = 20;
 pub const NETPLAY_EVENT_LIMIT: usize = 32;
 pub const DIAGNOSTICS_SESSION_LIST_LIMIT: usize = 10;
