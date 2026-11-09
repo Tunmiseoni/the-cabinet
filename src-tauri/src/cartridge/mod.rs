@@ -1,9 +1,12 @@
 pub(crate) mod assets;
 pub(crate) mod context;
+#[cfg(test)]
+pub(crate) mod fake;
 pub(crate) mod footprint;
 pub(crate) mod install;
 pub(crate) mod registry;
 pub(crate) mod room;
+pub(crate) mod runtime;
 pub(crate) mod store;
 #[cfg(test)]
 pub(crate) mod testing;
