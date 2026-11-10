@@ -37,6 +37,7 @@ impl Drop for Scratch {
 
 fn pack_tool(cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cabinet-pack"))
+        .env_remove("CABINET_PACK_KEY_PASSWORD")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -91,4 +92,54 @@ fn reports_errors_and_usage() {
     let usage = pack_tool(&scratch.0, &["frobnicate"]);
     assert_eq!(usage.status.code(), Some(2));
     assert!(String::from_utf8(usage.stderr).unwrap().contains("usage:"));
+}
+
+#[test]
+fn signs_with_a_generated_key() {
+    let scratch = Scratch::new("signed");
+    let keygen = pack_tool(&scratch.0, &["keygen", "publisher.key", "publisher.pub"]);
+    assert!(keygen.status.success(), "{keygen:?}");
+    let fingerprint = line(&String::from_utf8(keygen.stdout).unwrap(), "publisher").to_string();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(scratch.0.join("publisher.key"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let again = pack_tool(&scratch.0, &["keygen", "publisher.key", "other.pub"]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(!scratch.0.join("other.pub").exists());
+
+    let packed = pack_tool(
+        &scratch.0,
+        &[
+            "pack",
+            "src",
+            "--key",
+            "publisher.key",
+            "--out",
+            "signed.cart",
+        ],
+    );
+    assert!(packed.status.success(), "{packed:?}");
+    assert_eq!(
+        line(&String::from_utf8(packed.stdout).unwrap(), "publisher"),
+        fingerprint
+    );
+
+    let inspected =
+        cabinet_cartridge::archive::inspect(&scratch.0.join("signed.cart"), None).unwrap();
+    let publisher = inspected.publisher.unwrap();
+    assert_eq!(publisher.fingerprint(), fingerprint);
+    let expected = cabinet_cartridge::Publisher::parse(
+        &std::fs::read_to_string(scratch.0.join("publisher.pub")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(publisher, expected);
+
+    let missing = pack_tool(&scratch.0, &["pack", "src", "--key", "nope.key"]);
+    assert_eq!(missing.status.code(), Some(1));
 }
