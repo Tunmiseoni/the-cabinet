@@ -1,0 +1,45 @@
+format      = 1
+id          = "test"
+version     = "0.1.0"
+title       = "Test cartridge"
+description = "Exercises the whole cartridge contract: service, session, widgets, settings, footprint."
+min_cabinet = "2.0.0"
+platforms   = ["macos-aarch64", "linux-x86_64", "windows-x86_64"]
+
+[room]
+max_members = 4
+late_join   = "always"
+
+[programs.echo.run]
+macos-aarch64  = "files/macos-aarch64/echo-cart"
+linux-x86_64   = "files/linux-x86_64/echo-cart"
+windows-x86_64 = "files/windows-x86_64/echo-cart.exe"
+
+[lifecycle.setup]
+program = "echo"
+args    = ["setup", "${setting:scratch_dir}/touch-test.txt"]
+
+[lifecycle.session]
+program = "echo"
+
+[lifecycle.service]
+program = "echo"
+args    = ["--service"]
+
+[lifecycle.uninstall]
+program = "echo"
+args    = ["uninstall"]
+
+[capabilities.hosts]
+names  = ["cabinet-test.invalid"]
+target = "service"
+scope  = "session"
+
+[[touches]]
+path = "${setting:scratch_dir}/touch-test.txt"
+
+[[settings]]
+key      = "scratch_dir"
+label    = "Scratch folder"
+type     = "dir"
+required = true
