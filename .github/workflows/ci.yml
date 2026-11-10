@@ -20,6 +20,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            exe: echo-cart
+          - os: macos-latest
+            platform: macos-aarch64
+            exe: echo-cart
+          - os: windows-latest
+            platform: windows-x86_64
+            exe: echo-cart.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -75,3 +85,55 @@ jobs:
       - name: cargo clippy
         working-directory: src-tauri
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build echo-cart
+        working-directory: src-tauri
+        run: cargo build --release -p echo-cart
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: echo-cart-${{ matrix.platform }}
+          path: src-tauri/target/release/${{ matrix.exe }}
+          if-no-files-found: error
+
+  test-cartridge:
+    name: pack the test cartridge
+    needs: check
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: echo-cart-*
+          path: builds
+
+      - name: Pack and sign with a throwaway key
+        run: |
+          mkdir -p stage
+          cp cartridges/test/cartridge.toml stage/
+          for platform in linux-x86_64 macos-aarch64 windows-x86_64; do
+            mkdir -p "stage/files/$platform"
+            cp builds/echo-cart-$platform/* "stage/files/$platform/"
+          done
+          cd src-tauri
+          cargo build --release -p cabinet-cartridge --bin cabinet-pack
+          pack=target/release/cabinet-pack
+          keys="$RUNNER_TEMP/keys"
+          mkdir -p "$keys"
+          "$pack" keygen "$keys/throwaway.key" "$keys/throwaway.pub"
+          "$pack" pack ../stage --out ../test-0.1.0.cart --key "$keys/throwaway.key"
+          "$pack" inspect ../test-0.1.0.cart
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-cartridge
+          path: test-0.1.0.cart
+          if-no-files-found: error
