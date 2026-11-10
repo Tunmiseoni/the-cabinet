@@ -4262,6 +4262,7 @@ dependencies = [
  "cabinet-cartridge",
  "core-foundation 0.10.1",
  "core-graphics",
+ "echo-cart",
  "libc",
  "log",
  "serde",

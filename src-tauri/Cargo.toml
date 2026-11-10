@@ -59,6 +59,9 @@ opt-level = 3
 panic = "abort"
 strip = true
 
+[dev-dependencies]
+echo-cart = { path = "../cartridges/test" }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility-sys = "0.2.0"
 core-foundation = "0.10.1"
