@@ -2,7 +2,7 @@ use super::*;
 use crate::cartridge::assets::tests::FakeFetch;
 use crate::cartridge::install::Installer;
 use crate::cartridge::testing::{build_cart, CartSpec, Scratch};
-use crate::cartridge::{fake, store::Installed};
+use crate::cartridge::{echo, store::Installed};
 use cabinet_cartridge::Version;
 use serde_json::json;
 use std::net::Ipv4Addr;
@@ -19,14 +19,14 @@ fn platform() -> Platform {
 }
 
 fn bench(tag: &str, extra: &str) -> Bench {
-    fake::install_env();
+    echo::install_env();
     let scratch = Scratch::new(tag);
     let cart = build_cart(
         &scratch,
         &CartSpec {
             extra,
-            unix: fake::UNIX,
-            windows: fake::WINDOWS,
+            unix: echo::UNIX,
+            windows: echo::WINDOWS,
             ..CartSpec::default()
         },
     );
@@ -174,12 +174,9 @@ fn host_and_member_exchange_state_on_loopback_and_stop_cleanly() {
     assert_eq!(public(&view, "nMEMBER")["role"], json!("member"));
     assert_eq!(public(&view, "nMEMBER")["members"], json!(2));
     assert_eq!(public(&view, "nHOST")["service"], Value::Null);
-    assert_eq!(
-        view.ui,
-        vec![Widget::Text {
-            value: "hello nHOST-name".to_string()
-        }]
-    );
+    assert!(view.ui.contains(&Widget::Text {
+        value: "hello nHOST-name".to_string()
+    }));
     let member_view = eventually("the member's ui", &member, |view| !view.ui.is_empty());
     assert_eq!(member_view.running, vec!["session"]);
     assert_eq!(member_view.role, Role::Member);

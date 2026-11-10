@@ -1,7 +1,7 @@
 pub(crate) mod assets;
 pub(crate) mod context;
 #[cfg(test)]
-pub(crate) mod fake;
+pub(crate) mod echo;
 pub(crate) mod footprint;
 pub(crate) mod install;
 pub(crate) mod registry;
