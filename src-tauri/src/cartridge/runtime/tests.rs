@@ -3,7 +3,9 @@ use crate::cartridge::assets::tests::FakeFetch;
 use crate::cartridge::install::Installer;
 use crate::cartridge::testing::{build_cart, CartSpec, Scratch};
 use crate::cartridge::{echo, store::Installed};
-use cabinet_cartridge::Version;
+use cabinet_cartridge::archive;
+use cabinet_cartridge::signature::KeySigner;
+use cabinet_cartridge::{Publisher, Version};
 use serde_json::json;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -366,4 +368,149 @@ fn a_member_without_the_rooms_build_is_told_to_install_it() {
     .unwrap();
     assert!(err.to_string().contains("install it first"), "{err}");
     block_on(host.stop());
+}
+
+fn echo_cart_binary() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let binary = exe
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("echo-cart{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        binary.is_file(),
+        "{} is missing: build it with `cargo build -p echo-cart` (`cargo test --workspace` does)",
+        binary.display()
+    );
+    binary
+}
+
+fn test_cartridge(tag: &str, settings: Map<String, Value>) -> (Bench, Publisher) {
+    let scratch = Scratch::new(tag);
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cartridges/test/cartridge.toml"),
+    )
+    .unwrap();
+    let manifest = Manifest::parse(&text, None).unwrap();
+    let stage = scratch.path("stage");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(stage.join("cartridge.toml"), &text).unwrap();
+    let own = format!("files/{}/", platform());
+    for bundled in manifest.bundled_paths() {
+        let path = stage.join(bundled);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if bundled.starts_with(&own) {
+            std::fs::copy(echo_cart_binary(), &path).unwrap();
+        } else {
+            std::fs::write(&path, b"another platform's build").unwrap();
+        }
+    }
+    let (secret, _) = KeySigner::generate(None).unwrap();
+    let signer = KeySigner::from_key_file(&secret, None).unwrap();
+    let cart = scratch.path("test-0.1.0.cart");
+    archive::pack(&stage, &cart, Some(&signer)).unwrap();
+    let mut store = Store::open(scratch.path("app")).unwrap();
+    let installed = Installer {
+        store: &mut store,
+        cabinet: Version::new(2, 0, 0),
+        platform: platform(),
+        fetch: &FakeFetch::default(),
+        log_dir: scratch.path("logs"),
+        now: 1,
+        busy: false,
+    }
+    .install(&cart, Some(settings))
+    .unwrap();
+    let bench = Bench {
+        scratch,
+        store: Arc::new(Mutex::new(store)),
+        installed,
+    };
+    (bench, signer.publisher())
+}
+
+fn kind(widget: &Widget) -> &'static str {
+    match widget {
+        Widget::Seats { .. } => "seats",
+        Widget::Score { .. } => "score",
+        Widget::Queue { .. } => "queue",
+        Widget::Prompt { .. } => "prompt",
+        Widget::Text { .. } => "text",
+        Widget::Button { .. } => "button",
+    }
+}
+
+#[test]
+fn the_test_cartridge_runs_end_to_end_on_loopback() {
+    let scratch_dir = Scratch::new("rt-echo-scratch");
+    let touch = scratch_dir.path("touch-test.txt");
+    let (bench, publisher) = test_cartridge(
+        "rt-echo",
+        Map::from_iter([(
+            "scratch_dir".to_string(),
+            json!(scratch_dir.path("").to_string_lossy()),
+        )]),
+    );
+    assert_eq!(
+        bench.installed.cartridge,
+        CartridgeRef::new(Some(&publisher), "test")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&touch).unwrap(),
+        echo_cart::TOUCH_TEXT
+    );
+
+    let host = bench.host("nHOST");
+    let member = bench.join(&host, "nMEMBER", "friend").unwrap();
+    block_on(host.start()).unwrap();
+    let view = eventually("both sides to see each other", &host, |view| {
+        view.room.members.iter().all(|m| m.status == Status::Ready)
+            && public(view, "nHOST")["seen"]["nMEMBER"] == json!("nMEMBER")
+            && public(view, "nMEMBER")["seen"]["nHOST"] == json!("nHOST")
+    });
+    assert_eq!(view.running, vec!["service", "session"]);
+    assert_eq!(view.room.service, Some(ServiceState { ready: true }));
+    assert_eq!(public(&view, "nHOST")["service"], json!("127.0.0.1"));
+    assert_eq!(public(&view, "nMEMBER")["service"], json!("127.0.0.1"));
+    assert_eq!(public(&view, "nMEMBER")["role"], json!("member"));
+    let kinds: Vec<&str> = view.ui.iter().map(kind).collect();
+    for expected in ["seats", "score", "queue", "prompt", "text", "button"] {
+        assert!(kinds.contains(&expected), "no {expected} in {kinds:?}");
+    }
+    let seated = eventually("the member in a seat", &member, |view| {
+        view.ui.iter().any(|widget| {
+            matches!(widget, Widget::Seats { slots }
+                if slots.iter().filter(|slot| slot.occupant.is_some()).count() == 2)
+        })
+    });
+    assert_eq!(seated.running, vec!["session"]);
+
+    member.action("bump");
+    eventually("the member's action", &host, |view| {
+        public(view, "nMEMBER")["actions"] == json!(["bump"])
+    });
+    let pids = [
+        public(&view, "nHOST")["pid"].clone(),
+        public(&view, "nMEMBER")["pid"].clone(),
+    ];
+    block_on(member.stop());
+    block_on(host.stop());
+    assert!(host.view().running.is_empty());
+    assert!(member.view().running.is_empty());
+    #[cfg(unix)]
+    for pid in &pids {
+        assert!(gone(pid), "pid {pid} still running");
+    }
+    let _ = pids;
+
+    let problems = crate::cartridge::install::uninstall(
+        &mut bench.store.lock_or_recover(),
+        &bench.installed.cartridge,
+        platform(),
+        &bench.scratch.path("logs"),
+    )
+    .unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
+    assert!(!touch.exists(), "the touch file outlived the uninstall");
 }
