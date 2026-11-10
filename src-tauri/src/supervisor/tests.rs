@@ -131,6 +131,7 @@ fn piped_stdin_reaches_the_program() {
     let child = spawn_with(&spec("findstr", &["^"]), Some(capture), Stdin::Piped).unwrap();
     assert!(child.send_line("hello"));
     assert!(child.send_line("world"));
+    child.close_stdin();
     assert_eq!(
         lines.recv_timeout(Duration::from_secs(5)).unwrap().trim(),
         "hello"
@@ -139,7 +140,6 @@ fn piped_stdin_reaches_the_program() {
         lines.recv_timeout(Duration::from_secs(5)).unwrap().trim(),
         "world"
     );
-    child.close_stdin();
     assert!(!child.send_line("late"));
     let exit = child.exit.wait_timeout(Duration::from_secs(10)).unwrap();
     assert_eq!(exit.code, Some(0));

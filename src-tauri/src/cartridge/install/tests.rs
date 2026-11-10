@@ -33,13 +33,17 @@ exit 0
 "#;
 
 const WINDOWS: &str = "@echo off\r\n\
-if \"%~1\"==\"setup\" (\r\n\
-  if exist \"%~3\\fail\" exit /b 3\r\n\
-  >\"%~3\\touch-test.txt\" echo %~2\r\n\
-)\r\n\
-if \"%~1\"==\"uninstall\" (\r\n\
-  >\"%~3\\uninstalled.txt\" echo %~2\r\n\
-)\r\n\
+if \"%~1\"==\"setup\" goto setup\r\n\
+if \"%~1\"==\"uninstall\" goto uninstall\r\n\
+exit /b 0\r\n\
+:setup\r\n\
+if exist \"%~3\\fail\" goto fail\r\n\
+>\"%~3\\touch-test.txt\" echo %~2\r\n\
+exit /b 0\r\n\
+:fail\r\n\
+exit /b 3\r\n\
+:uninstall\r\n\
+>\"%~3\\uninstalled.txt\" echo %~2\r\n\
 exit /b 0\r\n";
 
 struct Fixture {
