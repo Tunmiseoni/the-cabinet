@@ -1,46 +1,54 @@
 use super::cli_command;
 use crate::net::{Network, Node};
 use crate::sync::MutexExt;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+fn nullable<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct RawStatus {
-    #[serde(rename = "BackendState", default)]
+    #[serde(rename = "BackendState", default, deserialize_with = "nullable")]
     backend_state: String,
-    #[serde(rename = "Self", default)]
+    #[serde(rename = "Self", default, deserialize_with = "nullable")]
     self_node: Option<RawPeer>,
-    #[serde(rename = "Peer", default)]
+    #[serde(rename = "Peer", default, deserialize_with = "nullable")]
     peers: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
 struct RawPeer {
-    #[serde(rename = "ID", default)]
+    #[serde(rename = "ID", default, deserialize_with = "nullable")]
     id: String,
-    #[serde(rename = "HostName", default)]
+    #[serde(rename = "HostName", default, deserialize_with = "nullable")]
     hostname: String,
-    #[serde(rename = "DNSName", default)]
+    #[serde(rename = "DNSName", default, deserialize_with = "nullable")]
     dns_name: String,
-    #[serde(rename = "OS", default)]
+    #[serde(rename = "OS", default, deserialize_with = "nullable")]
     os: String,
-    #[serde(rename = "TailscaleIPs", default)]
+    #[serde(rename = "TailscaleIPs", default, deserialize_with = "nullable")]
     ips: Vec<String>,
-    #[serde(rename = "Online", default)]
+    #[serde(rename = "Online", default, deserialize_with = "nullable")]
     online: bool,
-    #[serde(rename = "Active", default)]
+    #[serde(rename = "Active", default, deserialize_with = "nullable")]
     active: bool,
-    #[serde(rename = "CurAddr", default)]
+    #[serde(rename = "CurAddr", default, deserialize_with = "nullable")]
     cur_addr: String,
-    #[serde(rename = "Relay", default)]
+    #[serde(rename = "Relay", default, deserialize_with = "nullable")]
     relay: String,
-    #[serde(rename = "RxBytes", default)]
+    #[serde(rename = "RxBytes", default, deserialize_with = "nullable")]
     rx_bytes: u64,
-    #[serde(rename = "TxBytes", default)]
+    #[serde(rename = "TxBytes", default, deserialize_with = "nullable")]
     tx_bytes: u64,
-    #[serde(rename = "LastSeen", default)]
+    #[serde(rename = "LastSeen", default, deserialize_with = "nullable")]
     last_seen: String,
 }
 
@@ -224,6 +232,20 @@ mod tests {
         assert_eq!(tailnet.backend_state, "Stopped");
         assert!(tailnet.self_peer.is_none());
         assert!(tailnet.peers.is_empty());
+    }
+
+    #[test]
+    fn tolerates_null_lists_and_fields_when_stopped() {
+        let tailnet = parse_status(
+            r#"{"BackendState":"Stopped","Self":{"ID":"nSELF","HostName":"mac-host","TailscaleIPs":null,"Relay":null},"Peer":{"nodekey:b":{"ID":"nodeB","HostName":"cachyos-host","TailscaleIPs":["100.64.0.2"],"CurAddr":null,"Addrs":null}}}"#,
+        )
+        .expect("should parse");
+        assert_eq!(tailnet.backend_state, "Stopped");
+        let self_peer = tailnet.self_peer.expect("self present");
+        assert_eq!(self_peer.node_id, "nSELF");
+        assert_eq!(self_peer.ip, "");
+        assert_eq!(tailnet.peers.len(), 1);
+        assert_eq!(tailnet.peers[0].ip, "100.64.0.2");
     }
 
     #[test]
