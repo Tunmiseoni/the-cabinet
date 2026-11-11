@@ -1,5 +1,6 @@
 use crate::cartridge::assets::HttpFetch;
 use crate::cartridge::install::{self, Installer};
+use crate::cartridge::privileged;
 use crate::cartridge::registry::{CartridgeRef, Entry};
 use crate::cartridge::runtime::{HostOptions, JoinOptions, Me, Prepared, Session, SessionView};
 use crate::cartridge::store::{Installed, Store};
@@ -238,7 +239,13 @@ pub fn cartridge_uninstall(
     let platform = platform()?;
     let log_dir = log_dir(&app)?;
     Ok(with_store(&app, |store| {
-        install::uninstall(store, &cartridge, platform, &log_dir)
+        install::uninstall(
+            store,
+            &cartridge,
+            platform,
+            &log_dir,
+            privileged::system().as_deref(),
+        )
     })?)
 }
 
@@ -385,6 +392,7 @@ pub fn cartridge_host(
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             verify,
             log_dir: log_dir(&app)?,
+            helper: privileged::system(),
         },
         observer(&app),
     )?;
@@ -425,6 +433,7 @@ pub fn cartridge_join(
             host,
             port: port.unwrap_or(constants::LOBBY_BEACON_PORT),
             log_dir: log_dir(&app)?,
+            helper: privileged::system(),
         },
         observer(&app),
     )?;

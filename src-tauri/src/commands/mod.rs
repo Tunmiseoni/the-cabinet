@@ -8,6 +8,7 @@ use tauri::AppHandle;
 pub(crate) mod cabinet;
 pub(crate) mod cartridge;
 pub(crate) mod config;
+pub(crate) mod helper;
 pub(crate) mod launch;
 pub(crate) mod lobby;
 

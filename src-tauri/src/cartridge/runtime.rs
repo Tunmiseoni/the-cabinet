@@ -1,11 +1,13 @@
 use super::assets::{self, CheckFailure};
 use super::context::Context;
+use super::privileged::{Privileges, SharedHelper};
 use super::registry::{self, CartridgeRef};
 use super::room::{
     JoinRequest, Joiner, Phase, Room, RoomCartridge, RoomClient, RoomHooks, RoomHost, RoomMember,
     ServiceState, StateUpdate, Status, PROTOCOL,
 };
 use super::store::Store;
+use super::trust::Grant;
 use crate::lobby::beacon::Beacon;
 use crate::supervisor::{self, Capture, Exit, Stdin, Supervised};
 use crate::sync::MutexExt;
@@ -34,6 +36,7 @@ pub struct Prepared {
     pub data_dir: PathBuf,
     pub settings: Map<String, Value>,
     pub platform: Platform,
+    pub grant: Grant,
 }
 
 impl Prepared {
@@ -55,9 +58,11 @@ impl Prepared {
             )
             .into());
         }
+        let manifest = store.manifest(&digest)?;
         Ok(Self {
             cartridge: cartridge.clone(),
-            manifest: store.manifest(&digest)?,
+            grant: store.registry().grant(entry, &manifest.capabilities),
+            manifest,
             cartridge_dir: store.unpacked(&digest),
             data_dir: store.data_dir(cartridge),
             settings: entry.settings.clone(),
@@ -102,6 +107,16 @@ impl Prepared {
         }
     }
 
+    fn privileges(&self, helper: Option<SharedHelper>) -> Privileges {
+        Privileges::new(
+            helper,
+            &self.cartridge,
+            &self.manifest.title,
+            &self.manifest.capabilities,
+            self.grant,
+        )
+    }
+
     fn room_cartridge(&self) -> RoomCartridge {
         RoomCartridge {
             publisher: self.cartridge.publisher.clone(),
@@ -128,12 +143,14 @@ pub struct HostOptions {
     pub app_version: String,
     pub verify: Verify,
     pub log_dir: PathBuf,
+    pub helper: Option<SharedHelper>,
 }
 
 pub struct JoinOptions {
     pub host: String,
     pub port: u16,
     pub log_dir: PathBuf,
+    pub helper: Option<SharedHelper>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -226,6 +243,7 @@ struct Actor {
     role: Role,
     me: Me,
     prepared: Prepared,
+    privileges: Privileges,
     log_dir: PathBuf,
     service_address: String,
     link: Link,
@@ -437,8 +455,12 @@ impl Actor {
                 && !self.programs.contains_key(&Kind::Session)
             {
                 self.set_status(Status::Starting, None);
-                if let Err(err) = self.launch(Kind::Session) {
-                    self.fail(err.to_string());
+                let launched = match self.privileges.apply(&self.service_address) {
+                    Ok(()) => self.launch(Kind::Session).map_err(|err| err.to_string()),
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = launched {
+                    self.fail(err);
                 }
             }
         }
@@ -460,6 +482,7 @@ impl Actor {
             return Err("the session has already started".to_string());
         }
         self.prepared.preflight().map_err(|err| err.to_string())?;
+        self.privileges.apply(&self.service_address)?;
         let has_service = self.prepared.manifest.lifecycle.service.is_some();
         room.update(|room| {
             room.phase = Phase::Running;
@@ -590,6 +613,7 @@ impl Actor {
                 log::info!(target: LOG_TARGET, "stopped {} ({exit:?})", self.label(kind));
             }
         }
+        self.privileges.release();
         for (_, reply) in std::mem::take(&mut self.asks) {
             let _ = reply.send(Err("the room is closing".to_string()));
         }
@@ -735,6 +759,8 @@ impl Session {
         observer: Observer,
     ) -> crate::error::Result<Session> {
         prepared.preflight()?;
+        let privileges = prepared.privileges(options.helper);
+        privileges.check()?;
         let room = Room {
             protocol: PROTOCOL,
             room_id: format!("{}-{}", me.id, crate::time::now_ms()),
@@ -785,6 +811,7 @@ impl Session {
             },
             me,
             prepared,
+            privileges,
             log_dir: options.log_dir,
             service_address: "127.0.0.1".to_string(),
             link: Link::Host {
@@ -820,6 +847,8 @@ impl Session {
         let preview = client.room(None)?;
         let prepared = prepare(&preview.cartridge)?;
         prepared.preflight()?;
+        let privileges = prepared.privileges(options.helper);
+        privileges.check()?;
         let room = client.join(&JoinRequest {
             member: Joiner {
                 id: me.id.clone(),
@@ -895,6 +924,7 @@ impl Session {
             },
             me,
             prepared,
+            privileges,
             log_dir: options.log_dir,
             service_address: options.host.clone(),
             link: Link::Member { client, updates },

@@ -135,6 +135,7 @@ fn setup_runs_after_the_footprint_snapshot_and_uninstall_restores_it() {
         &installed.cartridge,
         Platform::current().unwrap(),
         &fixture.scratch.path("logs"),
+        None,
     )
     .unwrap();
     assert!(problems.is_empty(), "{problems:?}");
@@ -169,6 +170,7 @@ fn an_update_keeps_the_settings_and_the_original_snapshot() {
         &installed.cartridge,
         Platform::current().unwrap(),
         &fixture.scratch.path("logs"),
+        None,
     )
     .unwrap();
     assert!(!fixture.touch_file().exists());

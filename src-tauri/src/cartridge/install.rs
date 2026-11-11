@@ -1,6 +1,7 @@
 use super::assets::{self, Fetch};
 use super::context::Context;
 use super::footprint;
+use super::privileged::{self, Helper};
 use super::registry::{self, CartridgeRef};
 use super::store::{Installed, Staged, Store};
 use super::trust::{Approval, Decision};
@@ -199,12 +200,15 @@ pub fn uninstall(
     cartridge: &CartridgeRef,
     platform: Platform,
     log_dir: &Path,
+    helper: Option<&dyn Helper>,
 ) -> crate::error::Result<Vec<String>> {
     let entry = store.entry(cartridge)?.clone();
     let mut problems = Vec::new();
+    let mut privileged = entry.approved_capabilities.is_some();
     if let Some(digest) = entry.active.as_deref() {
         match store.manifest(digest) {
             Ok(manifest) => {
+                privileged |= !manifest.capabilities.is_empty();
                 if let Err(err) = run_uninstall_step(
                     store,
                     cartridge,
@@ -218,6 +222,16 @@ pub fn uninstall(
                 }
             }
             Err(err) => problems.push(err.to_string()),
+        }
+    }
+    if let Some(helper) = helper {
+        match helper.forget(&privileged::owner(cartridge)) {
+            Ok(undone) if undone > 0 => {
+                log::info!("undid {undone} privileged change(s) of {cartridge}")
+            }
+            Ok(_) => {}
+            Err(err) if privileged => problems.push(err),
+            Err(_) => {}
         }
     }
     let footprint = store.footprint_dir(cartridge);

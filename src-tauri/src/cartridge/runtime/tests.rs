@@ -1,6 +1,7 @@
 use super::*;
 use crate::cartridge::assets::tests::FakeFetch;
 use crate::cartridge::install::Installer;
+use crate::cartridge::privileged::SharedHelper;
 use crate::cartridge::testing::{build_cart, CartSpec, Scratch};
 use crate::cartridge::trust::{Approval, Grant, Standing};
 use crate::cartridge::{echo, store::Installed};
@@ -15,6 +16,7 @@ struct Bench {
     scratch: Scratch,
     store: Arc<Mutex<Store>>,
     installed: Installed,
+    helper: Option<SharedHelper>,
 }
 
 fn platform() -> Platform {
@@ -49,6 +51,7 @@ fn bench(tag: &str, extra: &str) -> Bench {
         scratch,
         store: Arc::new(Mutex::new(store)),
         installed,
+        helper: None,
     }
 }
 
@@ -85,6 +88,7 @@ impl Bench {
                 app_version: "0.1.15".to_string(),
                 verify: Arc::new(|_, _| true),
                 log_dir: self.scratch.path(&format!("logs/{id}")),
+                helper: self.helper.clone(),
             },
             quiet(),
         )
@@ -113,6 +117,7 @@ impl Bench {
                 host: "127.0.0.1".to_string(),
                 port: host.addresses()[0].port(),
                 log_dir: self.scratch.path(&format!("logs/{id}")),
+                helper: self.helper.clone(),
             },
             quiet(),
         )
@@ -324,6 +329,7 @@ fn checks_and_settings_gate_hosting_and_starting() {
             app_version: "0.1.15".to_string(),
             verify: Arc::new(|_, _| true),
             log_dir: bench.scratch.path("logs"),
+            helper: None,
         },
         quiet(),
     )
@@ -352,6 +358,7 @@ fn a_member_without_the_rooms_build_is_told_to_install_it() {
             host: "127.0.0.1".to_string(),
             port,
             log_dir: bench.scratch.path("logs"),
+            helper: None,
         },
         quiet(),
     )
@@ -434,8 +441,165 @@ fn test_cartridge(tag: &str, settings: Map<String, Value>) -> (Bench, Publisher)
         scratch,
         store: Arc::new(Mutex::new(store)),
         installed,
+        helper: None,
     };
     (bench, signer.publisher())
+}
+
+#[cfg(unix)]
+struct FakeSystem {
+    socket: PathBuf,
+    hosts: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeSystem {
+    const HOSTS: &'static str = "127.0.0.1\tlocalhost\n# >>> other-tool\n127.0.0.1 api.example-game.net\n# <<< other-tool\n";
+    const REDIRECT: &'static str = "127.0.0.1 cabinet-test.invalid\n";
+
+    fn start(scratch: &Scratch) -> Self {
+        let dir = scratch.path("system");
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Self {
+            socket: dir.join("helper.sock"),
+            hosts: dir.join("hosts"),
+        };
+        std::fs::write(&system.hosts, Self::HOSTS).unwrap();
+        let server = cabinet_helper::server::Server::bind(cabinet_helper::server::Config {
+            socket: system.socket.clone(),
+            state_dir: dir.join("state"),
+            hosts: system.hosts.clone(),
+            uid: None,
+            flush: false,
+        })
+        .unwrap();
+        std::thread::spawn(move || server.run());
+        system
+    }
+
+    fn helper(&self) -> SharedHelper {
+        Arc::new(crate::cartridge::privileged::SocketHelper {
+            socket: self.socket.clone(),
+            installed: None,
+        })
+    }
+
+    fn hosts(&self) -> String {
+        std::fs::read_to_string(&self.hosts).unwrap()
+    }
+
+    fn redirects(&self) -> usize {
+        self.hosts().matches(Self::REDIRECT).count()
+    }
+
+    fn leave_a_redirect(&self, cartridge: &CartridgeRef) -> cabinet_helper::client::Client {
+        let mut client = cabinet_helper::client::Client::connect(&self.socket).unwrap();
+        client
+            .apply(
+                &crate::cartridge::privileged::owner(cartridge),
+                cabinet_helper::protocol::Scope::Session,
+                &cabinet_helper::protocol::Change::Hosts {
+                    names: vec!["cabinet-test.invalid".to_string()],
+                    target: Ipv4Addr::LOCALHOST,
+                },
+            )
+            .unwrap();
+        assert_eq!(self.redirects(), 1);
+        client
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs The Cabinet's helper installed on this Mac; it edits /etc/hosts"]
+fn the_installed_helper_redirects_the_test_name_for_a_session() {
+    let system = FakeSystem {
+        socket: cabinet_helper::system::SOCKET.into(),
+        hosts: cabinet_helper::system::HOSTS.into(),
+    };
+    let before = system.hosts();
+    assert_eq!(system.redirects(), 0, "{before}");
+    let scratch_dir = Scratch::new("rt-live-helper-scratch");
+    let (mut bench, _) = test_cartridge(
+        "rt-live-helper",
+        Map::from_iter([(
+            "scratch_dir".to_string(),
+            json!(scratch_dir.path("").to_string_lossy()),
+        )]),
+    );
+    bench.helper = crate::cartridge::privileged::system();
+    let settled = |what: &str, wanted: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while system.redirects() != wanted {
+            assert!(Instant::now() < deadline, "{what}: {}", system.hosts());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let host = bench.host("nHOST");
+    let member = bench.join(&host, "nMEMBER", "friend").unwrap();
+    assert_eq!(system.redirects(), 0);
+    block_on(host.start()).unwrap();
+    eventually("both sides ready", &host, |view| {
+        view.room.members.iter().all(|m| m.status == Status::Ready)
+    });
+    assert_eq!(system.redirects(), 2, "{}", system.hosts());
+    block_on(member.stop());
+    assert_eq!(system.redirects(), 1, "{}", system.hosts());
+    block_on(host.stop());
+    assert_eq!(system.hosts(), before);
+
+    let crashed = system.leave_a_redirect(&bench.installed.cartridge);
+    drop(crashed);
+    settled("a crashed caller's redirect is undone", 0);
+    assert_eq!(system.hosts(), before);
+
+    let _held = system.leave_a_redirect(&bench.installed.cartridge);
+    let problems = crate::cartridge::install::uninstall(
+        &mut bench.store.lock_or_recover(),
+        &bench.installed.cartridge,
+        platform(),
+        &bench.scratch.path("logs"),
+        bench.helper.as_deref(),
+    )
+    .unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(system.hosts(), before);
+}
+
+const NEEDS_HOSTS: &str = "[lifecycle.service]\nprogram = \"main\"\n\n[capabilities.hosts]\nnames = [\"cabinet-test.invalid\"]\ntarget = \"service\"\nscope = \"session\"\n";
+
+#[test]
+fn withheld_capabilities_block_hosting_where_a_helper_exists() {
+    use crate::cartridge::privileged::tests::FakeHelper;
+    let mut bench = bench("rt-withheld", NEEDS_HOSTS);
+    assert_eq!(bench.prepared().grant, Grant::Withheld);
+    let helper = Arc::new(FakeHelper::default());
+    let applied = Arc::clone(&helper.applied);
+    bench.helper = Some(helper);
+    let err = Session::host(
+        bench.prepared(),
+        me("nHOST"),
+        HostOptions {
+            bind: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            port: 0,
+            address: "127.0.0.1".to_string(),
+            app_version: "0.1.15".to_string(),
+            verify: Arc::new(|_, _| true),
+            log_dir: bench.scratch.path("logs"),
+            helper: bench.helper.clone(),
+        },
+        quiet(),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("not approved"), "{err}");
+    assert!(applied.lock_or_recover().is_empty());
+
+    bench.helper = None;
+    let host = bench.host("nHOST");
+    block_on(host.stop());
 }
 
 fn kind(widget: &Widget) -> &'static str {
@@ -453,7 +617,8 @@ fn kind(widget: &Widget) -> &'static str {
 fn the_test_cartridge_runs_end_to_end_on_loopback() {
     let scratch_dir = Scratch::new("rt-echo-scratch");
     let touch = scratch_dir.path("touch-test.txt");
-    let (bench, publisher) = test_cartridge(
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let (mut bench, publisher) = test_cartridge(
         "rt-echo",
         Map::from_iter([(
             "scratch_dir".to_string(),
@@ -478,8 +643,20 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
         echo_cart::TOUCH_TEXT
     );
 
+    #[cfg(unix)]
+    let system = FakeSystem::start(&bench.scratch);
+    #[cfg(unix)]
+    {
+        bench.helper = Some(system.helper());
+    }
     let host = bench.host("nHOST");
     let member = bench.join(&host, "nMEMBER", "friend").unwrap();
+    #[cfg(unix)]
+    assert_eq!(
+        system.redirects(),
+        0,
+        "redirected before the session started"
+    );
     block_on(host.start()).unwrap();
     let view = eventually("both sides to see each other", &host, |view| {
         view.room.members.iter().all(|m| m.status == Status::Ready)
@@ -511,10 +688,18 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
         public(&view, "nHOST")["pid"].clone(),
         public(&view, "nMEMBER")["pid"].clone(),
     ];
+    #[cfg(unix)]
+    assert_eq!(system.redirects(), 2, "{}", system.hosts());
     block_on(member.stop());
+    #[cfg(unix)]
+    assert_eq!(system.redirects(), 1, "{}", system.hosts());
     block_on(host.stop());
+    #[cfg(unix)]
+    assert_eq!(system.hosts(), FakeSystem::HOSTS);
     assert!(host.view().running.is_empty());
     assert!(member.view().running.is_empty());
+    #[cfg(unix)]
+    let _left_behind = system.leave_a_redirect(&bench.installed.cartridge);
     #[cfg(unix)]
     for pid in &pids {
         assert!(gone(pid), "pid {pid} still running");
@@ -526,8 +711,11 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
         &bench.installed.cartridge,
         platform(),
         &bench.scratch.path("logs"),
+        bench.helper.as_deref(),
     )
     .unwrap();
     assert!(problems.is_empty(), "{problems:?}");
     assert!(!touch.exists(), "the touch file outlived the uninstall");
+    #[cfg(unix)]
+    assert_eq!(system.hosts(), FakeSystem::HOSTS);
 }
