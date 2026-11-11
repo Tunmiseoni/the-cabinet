@@ -3,6 +3,7 @@ use crate::cartridge::install::{self, Installer};
 use crate::cartridge::registry::{CartridgeRef, Entry};
 use crate::cartridge::runtime::{HostOptions, JoinOptions, Me, Prepared, Session, SessionView};
 use crate::cartridge::store::{Installed, Store};
+use crate::cartridge::trust::{self, Approval, Grant, Outlook, PublisherView, TrustedPublisher};
 use crate::commands::config::load_config;
 use crate::constants;
 use crate::error::CommandResult;
@@ -104,9 +105,12 @@ pub struct Inspection {
     pub description: Option<String>,
     pub digest: String,
     pub publisher: String,
+    pub trust: PublisherView,
     pub platforms: Vec<Platform>,
     pub available: bool,
     pub capabilities: Capabilities,
+    pub capability_lines: Vec<String>,
+    pub outlook: Outlook,
     pub settings: Vec<Setting>,
     pub installed: bool,
 }
@@ -117,11 +121,16 @@ pub fn cartridge_inspect(app: AppHandle, path: PathBuf) -> CommandResult<Inspect
         .map_err(crate::error::CabinetError::from)?;
     let manifest = inspected.manifest;
     let cartridge = CartridgeRef::new(inspected.publisher.as_ref(), &manifest.id);
-    let installed = with_store(&app, |store| {
-        Ok(store
-            .registry()
-            .entry(&cartridge)
-            .is_some_and(|entry| entry.held(&inspected.digest).is_some()))
+    let publisher = inspected.publisher.as_ref();
+    let (installed, trust, outlook) = with_store(&app, |store| {
+        let registry = store.registry();
+        Ok((
+            registry
+                .entry(&cartridge)
+                .is_some_and(|entry| entry.held(&inspected.digest).is_some()),
+            registry.publisher_view(publisher),
+            registry.outlook(&cartridge, publisher, &manifest.capabilities),
+        ))
     })?;
     Ok(Inspection {
         available: Platform::current().is_some_and(|platform| manifest.supports(platform)),
@@ -131,7 +140,10 @@ pub fn cartridge_inspect(app: AppHandle, path: PathBuf) -> CommandResult<Inspect
         description: manifest.description,
         digest: inspected.digest,
         publisher: cartridge.publisher,
+        trust,
         platforms: manifest.platforms,
+        capability_lines: trust::describe(&manifest.capabilities),
+        outlook,
         capabilities: manifest.capabilities,
         settings: manifest.settings,
         installed,
@@ -143,6 +155,7 @@ pub fn cartridge_install(
     app: AppHandle,
     path: PathBuf,
     settings: Option<Map<String, Value>>,
+    approval: Option<Approval>,
 ) -> CommandResult<Installed> {
     let platform = platform()?;
     let log_dir = log_dir(&app)?;
@@ -157,7 +170,7 @@ pub fn cartridge_install(
             now: crate::time::now_ms(),
             busy,
         }
-        .install(&path, settings)
+        .install(&path, settings, &approval.unwrap_or_default())
     })?)
 }
 
@@ -165,6 +178,8 @@ pub fn cartridge_install(
 #[serde(rename_all = "camelCase")]
 pub struct Listed {
     pub entry: Entry,
+    pub trust: PublisherView,
+    pub grant: Grant,
     pub title: Option<String>,
     pub settings_schema: Vec<Setting>,
 }
@@ -183,6 +198,10 @@ pub fn cartridge_list(app: AppHandle) -> CommandResult<Vec<Listed>> {
                     .and_then(|digest| store.manifest(digest).ok());
                 Listed {
                     entry: entry.clone(),
+                    trust: store
+                        .registry()
+                        .publisher_view(entry.publisher_key.as_ref()),
+                    grant: store.grant(entry),
                     title: manifest.as_ref().map(|manifest| manifest.title.clone()),
                     settings_schema: manifest
                         .map(|manifest| manifest.settings)
@@ -220,6 +239,43 @@ pub fn cartridge_uninstall(
     let log_dir = log_dir(&app)?;
     Ok(with_store(&app, |store| {
         install::uninstall(store, &cartridge, platform, &log_dir)
+    })?)
+}
+
+#[tauri::command(async)]
+pub fn cartridge_publishers(app: AppHandle) -> CommandResult<Vec<TrustedPublisher>> {
+    Ok(with_store(&app, |store| {
+        Ok(store.registry().publishers.clone())
+    })?)
+}
+
+#[tauri::command(async)]
+pub fn cartridge_trust_publisher(
+    app: AppHandle,
+    publisher: String,
+    name: String,
+) -> CommandResult<()> {
+    Ok(with_store(&app, |store| {
+        store.trust_publisher(&publisher, &name, crate::time::now_ms())
+    })?)
+}
+
+#[tauri::command(async)]
+pub fn cartridge_forget_publisher(app: AppHandle, publisher: String) -> CommandResult<()> {
+    Ok(with_store(&app, |store| {
+        store.forget_publisher(&publisher)
+    })?)
+}
+
+#[tauri::command(async)]
+pub fn cartridge_approve_capabilities(
+    app: AppHandle,
+    publisher: String,
+    id: String,
+) -> CommandResult<()> {
+    let cartridge = CartridgeRef { publisher, id };
+    Ok(with_store(&app, |store| {
+        store.approve_capabilities(&cartridge)
     })?)
 }
 

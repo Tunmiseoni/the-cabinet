@@ -10,3 +10,4 @@ pub(crate) mod runtime;
 pub(crate) mod store;
 #[cfg(test)]
 pub(crate) mod testing;
+pub(crate) mod trust;

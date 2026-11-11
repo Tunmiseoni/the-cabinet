@@ -204,6 +204,8 @@ impl Entry {
 pub struct Registry {
     #[serde(default)]
     pub entries: Vec<Entry>,
+    #[serde(default)]
+    pub publishers: Vec<super::trust::TrustedPublisher>,
 }
 
 impl Registry {

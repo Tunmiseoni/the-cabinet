@@ -3,6 +3,7 @@ use super::context::Context;
 use super::footprint;
 use super::registry::{self, CartridgeRef};
 use super::store::{Installed, Staged, Store};
+use super::trust::{Approval, Decision};
 use crate::supervisor::{self, Capture, Stdin};
 use cabinet_cartridge::manifest::{Manifest, StepKind};
 use cabinet_cartridge::{Platform, Version};
@@ -109,16 +110,34 @@ impl Installer<'_> {
         )
     }
 
+    fn admit(
+        &self,
+        staged: &Staged,
+        settings: Option<Map<String, Value>>,
+        approval: &Approval,
+    ) -> crate::error::Result<(Map<String, Value>, Decision)> {
+        let manifest = &staged.inspected.manifest;
+        let decision = self.store.registry().decide(
+            &staged.cartridge,
+            &manifest.title,
+            staged.inspected.publisher.as_ref(),
+            &manifest.capabilities,
+            approval,
+        )?;
+        Ok((effective_settings(self.store, staged, settings)?, decision))
+    }
+
     pub fn install(
         self,
         cart: &Path,
         settings: Option<Map<String, Value>>,
+        approval: &Approval,
     ) -> crate::error::Result<Installed> {
         let staged = self
             .store
             .stage(cart, &self.cabinet, self.platform, self.now)?;
-        let settings = match effective_settings(self.store, &staged, settings) {
-            Ok(settings) => settings,
+        let (settings, decision) = match self.admit(&staged, settings, approval) {
+            Ok(admitted) => admitted,
             Err(err) => {
                 self.store.discard(&staged);
                 return Err(err);
@@ -139,16 +158,28 @@ impl Installer<'_> {
                 return Err(err);
             }
         }
-        let installed = self.store.register(&staged, self.now, self.busy)?;
+        let mut installed = self.store.register(&staged, self.now, self.busy)?;
+        if let Some((key, name)) = &decision.trust {
+            self.store.trust_key(key, name, self.now)?;
+            log::info!("trusted publisher {} as {name}", key.fingerprint());
+        }
+        installed.capabilities = decision.grant;
         self.store.update(&installed.cartridge, |entry| {
             entry.settings = settings;
+            if entry
+                .active()
+                .is_none_or(|active| installed.version >= active.version)
+            {
+                entry.approved_capabilities = decision.approved;
+            }
             Ok(())
         })?;
         log::info!(
-            "installed {} {} ({})",
+            "installed {} {} ({}), capabilities {:?}",
             installed.cartridge,
             installed.version,
-            installed.digest
+            installed.digest,
+            installed.capabilities
         );
         Ok(installed)
     }
