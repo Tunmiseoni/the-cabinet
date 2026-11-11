@@ -125,6 +125,8 @@ pub fn run() {
                 }
             }
 
+            commands::helper::sweep_on_startup();
+
             let verbose = verbose_logging_requested(app.handle());
             log::set_max_level(if verbose {
                 log::LevelFilter::Debug
@@ -181,6 +183,9 @@ pub fn run() {
             commands::cartridge::cartridge_action,
             commands::cartridge::cartridge_stop,
             commands::cartridge::cartridge_session,
+            commands::helper::helper_status,
+            commands::helper::helper_install,
+            commands::helper::helper_uninstall,
             commands::cabinet::cabinet_status,
             commands::cabinet::cabinet_place,
             commands::cabinet::cabinet_release,

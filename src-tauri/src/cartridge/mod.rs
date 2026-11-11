@@ -4,6 +4,7 @@ pub(crate) mod context;
 pub(crate) mod echo;
 pub(crate) mod footprint;
 pub(crate) mod install;
+pub(crate) mod privileged;
 pub(crate) mod registry;
 pub(crate) mod room;
 pub(crate) mod runtime;
