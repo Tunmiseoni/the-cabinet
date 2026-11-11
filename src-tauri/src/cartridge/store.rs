@@ -1,7 +1,8 @@
 use super::registry::{self, Admission, CartridgeRef, Entry, Registry};
+use super::trust::Grant;
 use cabinet_cartridge::archive::{self, Inspected};
 use cabinet_cartridge::manifest::MANIFEST_PATH;
-use cabinet_cartridge::{Manifest, Platform, Version};
+use cabinet_cartridge::{Manifest, Platform, Publisher, Version};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
@@ -26,6 +27,7 @@ pub struct Installed {
     pub version: Version,
     pub digest: String,
     pub new: bool,
+    pub capabilities: Grant,
 }
 
 pub struct Store {
@@ -178,6 +180,7 @@ impl Store {
             version: manifest.version.clone(),
             digest: digest.clone(),
             new,
+            capabilities: Grant::None,
         })
     }
 
@@ -203,6 +206,60 @@ impl Store {
         registry::check_settings(&manifest, &settings)?;
         self.update(cartridge, |entry| {
             entry.settings = settings;
+            Ok(())
+        })
+    }
+
+    pub fn trust_key(&mut self, key: &Publisher, name: &str, now: u64) -> crate::error::Result<()> {
+        self.registry.trust(key, name, now)?;
+        self.save()
+    }
+
+    pub fn trust_publisher(
+        &mut self,
+        fingerprint: &str,
+        name: &str,
+        now: u64,
+    ) -> crate::error::Result<()> {
+        let key = self
+            .registry
+            .known_key(fingerprint)
+            .ok_or_else(|| format!("no cartridge from publisher {fingerprint} is installed"))?;
+        self.trust_key(&key, name, now)
+    }
+
+    pub fn forget_publisher(&mut self, fingerprint: &str) -> crate::error::Result<()> {
+        if !self.registry.forget_publisher(fingerprint) {
+            return Err(format!("publisher {fingerprint} is not trusted").into());
+        }
+        self.save()
+    }
+
+    pub fn grant(&self, entry: &Entry) -> Grant {
+        entry
+            .active
+            .as_deref()
+            .and_then(|digest| self.manifest(digest).ok())
+            .map_or(Grant::None, |manifest| {
+                self.registry.grant(entry, &manifest.capabilities)
+            })
+    }
+
+    pub fn approve_capabilities(&mut self, cartridge: &CartridgeRef) -> crate::error::Result<()> {
+        let manifest = self.manifest(&self.active_digest(cartridge)?)?;
+        if !self
+            .registry
+            .is_trusted(self.entry(cartridge)?.publisher_key.as_ref())
+        {
+            return Err(format!(
+                "{} cannot be given privileged capabilities until its publisher is trusted",
+                manifest.title
+            )
+            .into());
+        }
+        let declared = manifest.capabilities;
+        self.update(cartridge, |entry| {
+            entry.approved_capabilities = (!declared.is_empty()).then_some(declared);
             Ok(())
         })
     }

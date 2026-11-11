@@ -1,4 +1,5 @@
 use cabinet_cartridge::archive;
+use cabinet_cartridge::signature::{KeySigner, Signer};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -77,6 +78,7 @@ pub(crate) struct CartSpec<'a> {
     pub unix: &'a str,
     pub windows: &'a str,
     pub files: &'a [(&'a str, &'a [u8])],
+    pub signer: Option<&'a KeySigner>,
 }
 
 impl Default for CartSpec<'_> {
@@ -89,6 +91,7 @@ impl Default for CartSpec<'_> {
             unix: "#!/bin/sh\nexit 0\n",
             windows: "@exit /b 0\r\n",
             files: &[],
+            signer: None,
         }
     }
 }
@@ -110,7 +113,8 @@ pub(crate) fn build_cart(scratch: &Scratch, spec: &CartSpec<'_>) -> PathBuf {
         std::fs::write(path, content).unwrap();
     }
     let out = scratch.path(&format!("{}-{}.cart", spec.id, spec.version));
-    archive::pack(&source, &out, None).unwrap();
+    let signer = spec.signer.map(|signer| signer as &dyn Signer);
+    archive::pack(&source, &out, signer).unwrap();
     archive::remove_tree(&source).unwrap();
     out
 }

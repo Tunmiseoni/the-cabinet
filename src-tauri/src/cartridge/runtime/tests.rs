@@ -2,6 +2,7 @@ use super::*;
 use crate::cartridge::assets::tests::FakeFetch;
 use crate::cartridge::install::Installer;
 use crate::cartridge::testing::{build_cart, CartSpec, Scratch};
+use crate::cartridge::trust::{Approval, Grant, Standing};
 use crate::cartridge::{echo, store::Installed};
 use cabinet_cartridge::archive;
 use cabinet_cartridge::signature::KeySigner;
@@ -42,7 +43,7 @@ fn bench(tag: &str, extra: &str) -> Bench {
         now: 1,
         busy: false,
     }
-    .install(&cart, None)
+    .install(&cart, None, &Approval::default())
     .unwrap();
     Bench {
         scratch,
@@ -420,7 +421,14 @@ fn test_cartridge(tag: &str, settings: Map<String, Value>) -> (Bench, Publisher)
         now: 1,
         busy: false,
     }
-    .install(&cart, Some(settings))
+    .install(
+        &cart,
+        Some(settings),
+        &Approval {
+            trust_publisher: Some("Test publisher".to_string()),
+            capabilities: true,
+        },
+    )
     .unwrap();
     let bench = Bench {
         scratch,
@@ -456,6 +464,15 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
         bench.installed.cartridge,
         CartridgeRef::new(Some(&publisher), "test")
     );
+    assert_eq!(bench.installed.capabilities, Grant::Granted);
+    {
+        let store = bench.store.lock().unwrap();
+        let view = store.registry().publisher_view(Some(&publisher));
+        assert_eq!(view.standing, Standing::Trusted);
+        assert_eq!(view.name.as_deref(), Some("Test publisher"));
+        let entry = store.entry(&bench.installed.cartridge).unwrap();
+        assert_eq!(store.grant(entry), Grant::Granted);
+    }
     assert_eq!(
         std::fs::read_to_string(&touch).unwrap(),
         echo_cart::TOUCH_TEXT
