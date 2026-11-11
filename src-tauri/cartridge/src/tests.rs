@@ -384,6 +384,14 @@ fn validates_capabilities() {
         let ca = FULL_MANIFEST.replace("[\"example.test\"]", &format!("[\"{name}\"]"));
         assert_problem(&ca, "is not a registrable lowercase DNS name");
     }
+    for suffix in ["co.uk", "com.au", "github.io", "herokuapp.com"] {
+        let ca = FULL_MANIFEST.replace("[\"example.test\"]", &format!("[\"{suffix}\"]"));
+        assert_problem(&ca, "is a public suffix");
+    }
+    for name in ["example.co.uk", "example-game.net", "api.example-game.net"] {
+        let ca = FULL_MANIFEST.replace("[\"example.test\"]", &format!("[\"{name}\"]"));
+        Manifest::parse(&ca, None).unwrap();
+    }
     let session_hosts = FULL_MANIFEST.replace(
         "target = \"service\"\nscope  = \"session\"",
         "target = \"service\"\nscope  = \"install\"",

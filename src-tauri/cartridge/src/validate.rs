@@ -50,6 +50,10 @@ pub fn is_dns_name(value: &str) -> bool {
             .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
 }
 
+pub fn is_public_suffix(value: &str) -> bool {
+    psl::domain(value.as_bytes()).is_none()
+}
+
 struct Check<'a> {
     manifest: &'a Manifest,
     problems: Vec<String>,
@@ -334,6 +338,10 @@ impl Check<'_> {
                 if !is_dns_name(name) {
                     self.fail(format!(
                         "capabilities.trust_ca: \"{name}\" is not a registrable lowercase DNS name"
+                    ));
+                } else if is_public_suffix(name) {
+                    self.fail(format!(
+                        "capabilities.trust_ca: \"{name}\" is a public suffix; name a domain under it"
                     ));
                 }
             }
