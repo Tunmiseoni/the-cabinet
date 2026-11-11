@@ -1,0 +1,18 @@
+[package]
+name = "cabinet-helper"
+version = "0.1.0"
+description = "The Cabinet's privileged helper: a fixed menu of journaled system changes"
+authors = ["The Cabinet contributors"]
+edition = "2021"
+publish = false
+
+[lib]
+name = "cabinet_helper"
+
+[dependencies]
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
