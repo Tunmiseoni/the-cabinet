@@ -144,6 +144,14 @@ impl Prepared {
         )
         .with_ca(self.ca.clone())
         .with_programs(self.listeners(host))
+        .with_service_program(host.then(|| self.service_program()).flatten())
+    }
+
+    fn service_program(&self) -> Option<String> {
+        match self.context().program(StepKind::Service) {
+            Ok(Some(spec)) => Some(spec.program.to_string_lossy().into_owned()),
+            _ => None,
+        }
     }
 
     fn room_cartridge(&self) -> RoomCartridge {

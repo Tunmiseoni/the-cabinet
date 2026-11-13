@@ -95,6 +95,23 @@ impl Journal {
         Ok(entry)
     }
 
+    pub fn replace(&mut self, entry: Entry) -> Result<(), String> {
+        let Some(index) = self
+            .stored
+            .entries
+            .iter()
+            .position(|held| held.id == entry.id)
+        else {
+            return Err(format!("the journal has no entry {}", entry.id));
+        };
+        let previous = std::mem::replace(&mut self.stored.entries[index], entry);
+        if let Err(err) = self.save() {
+            self.stored.entries[index] = previous;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     pub fn remove(&mut self, id: &str) -> Result<(), String> {
         let Some(index) = self.stored.entries.iter().position(|entry| entry.id == id) else {
             return Ok(());

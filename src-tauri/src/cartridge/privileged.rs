@@ -43,21 +43,34 @@ pub fn session_changes(
     capabilities: &Capabilities,
     service: &str,
     programs: &[String],
+    service_program: Option<&str>,
 ) -> Result<Vec<Change>, String> {
     let mut changes = Vec::new();
+    if let Some(program) = service_program.filter(|_| low_ports_through_helper(capabilities)) {
+        changes.push(Change::LowPorts {
+            program: program.to_string(),
+            keep: false,
+        });
+    }
     if let Some(hosts) = &capabilities.hosts {
         changes.push(Change::Hosts {
             names: hosts.names.clone(),
             target: service_ip(service)?,
         });
     }
-    if capabilities.firewall.is_some() {
+    if let Some(firewall) = &capabilities.firewall {
         changes.extend(programs.iter().map(|program| Change::Firewall {
             program: program.clone(),
+            ports: firewall.inbound.clone(),
             keep: false,
+            opened: Vec::new(),
         }));
     }
     Ok(changes)
+}
+
+fn low_ports_through_helper(capabilities: &Capabilities) -> bool {
+    cfg!(target_os = "linux") && !capabilities.low_ports.is_empty()
 }
 
 fn settled(capabilities: &Capabilities) -> Vec<&'static str> {
@@ -81,13 +94,24 @@ fn settled(capabilities: &Capabilities) -> Vec<&'static str> {
             items.push("firewall");
         }
     }
+    if cfg!(target_os = "linux")
+        && capabilities
+            .trust_ca
+            .as_ref()
+            .is_some_and(|ca| ca.stores == [CaStore::System])
+    {
+        items.push("trust_ca");
+    }
     items
 }
 
 fn unsupported(capabilities: &Capabilities) -> Vec<&'static str> {
     let mut items = Vec::new();
     let settled = settled(capabilities);
-    if !capabilities.low_ports.is_empty() && !settled.contains(&"low_ports") {
+    if !capabilities.low_ports.is_empty()
+        && !settled.contains(&"low_ports")
+        && !low_ports_through_helper(capabilities)
+    {
         items.push("low_ports");
     }
     if let Some(ca) = &capabilities.trust_ca {
@@ -99,14 +123,15 @@ fn unsupported(capabilities: &Capabilities) -> Vec<&'static str> {
             });
         }
     }
-    if capabilities.firewall.is_some() && !settled.contains(&"firewall") {
+    let firewall_on_linux = cfg!(target_os = "linux")
+        && capabilities
+            .firewall
+            .as_ref()
+            .is_some_and(|firewall| firewall.scope == ManifestScope::Session);
+    if capabilities.firewall.is_some() && !settled.contains(&"firewall") && !firewall_on_linux {
         items.push("firewall");
     }
     items
-}
-
-fn through_helper(capabilities: &Capabilities) -> bool {
-    capabilities.hosts.is_some() || capabilities.firewall.is_some()
 }
 
 enum Route<'a> {
@@ -123,6 +148,7 @@ pub struct Privileges {
     grant: Grant,
     ca: CaState,
     programs: Vec<String>,
+    service_program: Option<String>,
     lease: Option<Box<dyn Lease>>,
 }
 
@@ -142,6 +168,7 @@ impl Privileges {
             grant,
             ca: CaState::NotNeeded,
             programs: Vec::new(),
+            service_program: None,
             lease: None,
         }
     }
@@ -149,6 +176,17 @@ impl Privileges {
     pub fn with_programs(mut self, programs: Vec<String>) -> Self {
         self.programs = programs;
         self
+    }
+
+    pub fn with_service_program(mut self, program: Option<String>) -> Self {
+        self.service_program = program;
+        self
+    }
+
+    fn through_helper(&self) -> bool {
+        self.capabilities.hosts.is_some()
+            || self.capabilities.firewall.is_some()
+            || (self.service_program.is_some() && low_ports_through_helper(&self.capabilities))
     }
 
     pub fn with_ca(mut self, ca: CaState) -> Self {
@@ -181,7 +219,7 @@ impl Privileges {
         if let CaState::Missing(reason) = &self.ca {
             return Err(reason.clone());
         }
-        if through_helper(&self.capabilities) {
+        if self.through_helper() {
             Ok(Route::Helper(helper))
         } else {
             Ok(Route::Nothing)
@@ -215,7 +253,12 @@ impl Privileges {
                 return Ok(());
             }
         };
-        let changes = session_changes(&self.capabilities, service, &self.programs)?;
+        let changes = session_changes(
+            &self.capabilities,
+            service,
+            &self.programs,
+            self.service_program.as_deref(),
+        )?;
         let mut lease = helper.lease()?;
         for change in changes {
             lease.apply(&self.owner, &change)?;
@@ -236,14 +279,12 @@ impl Privileges {
 }
 
 #[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct SocketHelper {
     pub socket: std::path::PathBuf,
     pub installed: Option<std::path::PathBuf>,
 }
 
 #[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl SocketHelper {
     pub fn absent(&self) -> bool {
         self.installed.as_ref().is_some_and(|path| !path.exists())
@@ -269,7 +310,6 @@ impl SocketHelper {
 }
 
 #[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct SocketLease(cabinet_helper::client::Client);
 
 #[cfg(unix)]
@@ -306,7 +346,7 @@ impl Helper for SocketHelper {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn system_socket() -> SocketHelper {
     SocketHelper {
         socket: cabinet_helper::system::SOCKET.into(),
@@ -315,11 +355,11 @@ pub fn system_socket() -> SocketHelper {
 }
 
 pub fn system() -> Option<SharedHelper> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         Some(Arc::new(system_socket()))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
@@ -573,6 +613,7 @@ pub(crate) mod tests {
                 "/store/game".to_string(),
             ]);
         privileges.apply("").unwrap();
+        let inbound = capabilities.firewall.unwrap().inbound;
         let programs: Vec<Change> = applied
             .lock_or_recover()
             .iter()
@@ -583,11 +624,15 @@ pub(crate) mod tests {
             vec![
                 Change::Firewall {
                     program: "/store/service".to_string(),
-                    keep: false
+                    ports: inbound.clone(),
+                    keep: false,
+                    opened: Vec::new(),
                 },
                 Change::Firewall {
                     program: "/store/game".to_string(),
-                    keep: false
+                    ports: inbound,
+                    keep: false,
+                    opened: Vec::new(),
                 },
             ]
         );
@@ -595,7 +640,42 @@ pub(crate) mod tests {
         assert!(applied.lock_or_recover().is_empty());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn low_ports_go_to_the_helper_for_the_hosts_service_program_on_linux() {
+        let capabilities = Capabilities {
+            low_ports: vec![443],
+            ..Capabilities::default()
+        };
+        let helper = Arc::new(FakeHelper::default());
+        let applied = Arc::clone(&helper.applied);
+        let mut member = privileges(Some(helper.clone()), &capabilities, Grant::Granted);
+        member.apply("127.0.0.1").unwrap();
+        assert!(applied.lock_or_recover().is_empty());
+        let mut host = privileges(Some(helper), &capabilities, Grant::Granted)
+            .with_programs(vec![
+                "/store/service".to_string(),
+                "/store/game".to_string(),
+            ])
+            .with_service_program(Some("/store/service".to_string()));
+        host.apply("127.0.0.1").unwrap();
+        let changes: Vec<Change> = applied
+            .lock_or_recover()
+            .iter()
+            .map(|(_, change)| change.clone())
+            .collect();
+        assert_eq!(
+            changes,
+            vec![Change::LowPorts {
+                program: "/store/service".to_string(),
+                keep: false,
+            }]
+        );
+        host.release();
+        assert!(applied.lock_or_recover().is_empty());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn low_ports_are_not_built_off_macos() {
         let capabilities = Capabilities {

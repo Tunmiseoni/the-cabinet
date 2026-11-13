@@ -1,7 +1,8 @@
+pub use cabinet_cartridge::manifest::{Port, Proto};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const LABEL: &str = "com.the-cabinet.helper";
 pub const MAX_LINE: usize = 64 * 1024;
 
@@ -22,7 +23,22 @@ pub enum Change {
     Firewall {
         program: String,
         #[serde(default)]
+        ports: Vec<Port>,
+        #[serde(default)]
         keep: bool,
+        #[serde(default)]
+        opened: Vec<Port>,
+    },
+    LowPorts {
+        program: String,
+        #[serde(default)]
+        keep: bool,
+    },
+    TrustCa {
+        certificate: String,
+        names: Vec<String>,
+        #[serde(default)]
+        anchor: String,
     },
 }
 

@@ -649,7 +649,7 @@ fn forgetting_the_publisher_or_changing_the_certificate_authority_updates_the_tr
         .is_none());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn openssl(dir: &Path, args: &[&str]) {
     let output = std::process::Command::new("/usr/bin/openssl")
         .args(args)
@@ -663,7 +663,7 @@ fn openssl(dir: &Path, args: &[&str]) {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn throwaway_ca(dir: &Path) -> Vec<u8> {
     std::fs::write(
         dir.join("ca.cnf"),
@@ -788,6 +788,91 @@ fn the_login_keychain_trusts_a_cartridge_certificate_authority_while_it_is_insta
     )
     .unwrap();
     assert!(!keychain.holds(&recorded.sha256).unwrap());
+    assert!(!verifies(&dir, "inside", "cabinet-test.invalid"));
+    outcome.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn verifies(dir: &Path, leaf: &str, name: &str) -> bool {
+    std::process::Command::new("/usr/bin/openssl")
+        .args(["verify", "-purpose", "sslserver", "-verify_hostname", name])
+        .arg(dir.join(format!("{leaf}.pem")))
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs The Cabinet's helper installed on this machine; it trusts a throwaway certificate authority system-wide"]
+fn the_installed_helper_trusts_a_cartridge_certificate_authority_while_it_is_installed() {
+    let trust = catrust::HelperTrust(crate::cartridge::privileged::system_socket());
+    let anchors = || {
+        crate::cartridge::privileged::system_socket()
+            .connect()
+            .unwrap()
+            .status()
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| match entry.change {
+                cabinet_helper::protocol::Change::TrustCa { anchor, .. } => Some(anchor),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(anchors().is_empty());
+    let mut fixture = Fixture::new("ca-live");
+    fixture.now = crate::time::now_ms();
+    let dir = fixture.scratch.path("ca");
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca = throwaway_ca(&dir);
+    assert!(!verifies(&dir, "inside", "cabinet-test.invalid"));
+
+    let signer = signer();
+    let cart = ca_cart(&fixture, &signer, "0.1.0", ONE_NAME, &ca);
+    let installed = Installer {
+        store: &mut fixture.store,
+        cabinet: Version::new(0, 1, 15),
+        platform: Platform::current().unwrap(),
+        fetch: &fixture.fetch,
+        log_dir: fixture.scratch.path("logs"),
+        now: fixture.now,
+        busy: false,
+        trust: Some(&trust),
+    }
+    .install(&cart, None, &trusting("Friend"))
+    .unwrap();
+    assert_eq!(installed.ca_problem, None);
+    let recorded = fixture
+        .store
+        .entry(&installed.cartridge)
+        .unwrap()
+        .trusted_ca
+        .clone()
+        .unwrap();
+    let placed = anchors();
+    let outcome = std::panic::catch_unwind(|| {
+        assert!(trust.holds(&recorded.sha256).unwrap());
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert!(Path::new(&placed[0]).exists(), "{placed:?}");
+        assert!(verifies(&dir, "inside", "cabinet-test.invalid"));
+        assert!(!verifies(&dir, "outside", "other-test.invalid"));
+        assert!(!verifies(&dir, "inside", "other-test.invalid"));
+    });
+
+    uninstall(
+        &mut fixture.store,
+        &installed.cartridge,
+        Platform::current().unwrap(),
+        &fixture.scratch.path("logs"),
+        None,
+        Some(&trust),
+    )
+    .unwrap();
+    assert!(!trust.holds(&recorded.sha256).unwrap());
+    assert!(anchors().is_empty());
+    assert!(placed.iter().all(|path| !Path::new(path).exists()));
     assert!(!verifies(&dir, "inside", "cabinet-test.invalid"));
     outcome.unwrap();
 }

@@ -1,35 +1,40 @@
 use crate::protocol::{self, Change, Entry, Request, Response, Scope, MAX_LINE};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::time::Duration;
 
+#[cfg_attr(not(unix), allow(dead_code))]
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Client {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Box<dyn Read + Send>>,
+    writer: Box<dyn Write + Send>,
 }
 
 impl Client {
-    pub fn connect(socket: &Path) -> Result<Self, String> {
-        let stream =
-            UnixStream::connect(socket).map_err(|err| format!("cannot reach the helper: {err}"))?;
+    pub fn over(reader: Box<dyn Read + Send>, writer: Box<dyn Write + Send>) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            writer,
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn connect(socket: &std::path::Path) -> Result<Self, String> {
+        let stream = std::os::unix::net::UnixStream::connect(socket)
+            .map_err(|err| format!("cannot reach the helper: {err}"))?;
         let prepared = stream
             .set_read_timeout(Some(TIMEOUT))
             .and_then(|()| stream.set_write_timeout(Some(TIMEOUT)))
             .and_then(|()| stream.try_clone());
         let writer = prepared.map_err(|err| format!("cannot talk to the helper: {err}"))?;
-        Ok(Self {
-            reader: BufReader::new(stream),
-            writer,
-        })
+        Ok(Self::over(Box::new(stream), Box::new(writer)))
     }
 
     pub fn call(&mut self, request: &Request) -> Result<Response, String> {
         let fail = |err: std::io::Error| format!("the helper did not answer: {err}");
         self.writer
             .write_all(format!("{}\n", protocol::encode(request)).as_bytes())
+            .and_then(|()| self.writer.flush())
             .map_err(fail)?;
         let mut line = String::new();
         (&mut self.reader)
@@ -100,7 +105,7 @@ impl Client {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::engine::tests::{hosts, Scratch, BASE, NAME, OWNER};
@@ -112,12 +117,13 @@ mod tests {
     fn serve(scratch: &Scratch) -> PathBuf {
         let socket = scratch.0.join("helper.sock");
         let server = Server::bind(Config {
-            socket: socket.clone(),
+            endpoint: socket.clone(),
             state_dir: scratch.0.clone(),
             hosts: scratch.hosts(),
-            uid: None,
+            user: None,
             flush: false,
             programs: None,
+            anchors: None,
         })
         .unwrap();
         std::thread::spawn(move || server.run());

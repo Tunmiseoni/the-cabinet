@@ -1,6 +1,8 @@
-use crate::firewall::Programs;
+use crate::anchors::Anchors;
+use crate::firewall::{AppFirewall, PortFirewall, Programs};
 use crate::hosts;
 use crate::journal::Journal;
+use crate::lowports::PortGrant;
 use crate::menu;
 use crate::protocol::{Change, Entry, Scope};
 use std::path::{Path, PathBuf};
@@ -10,6 +12,7 @@ pub struct Engine {
     hosts: PathBuf,
     flush: bool,
     programs: Option<Programs>,
+    anchors: Option<Box<dyn Anchors>>,
 }
 
 fn now_ms() -> u64 {
@@ -25,6 +28,7 @@ impl Engine {
             hosts: hosts.to_path_buf(),
             flush,
             programs: None,
+            anchors: None,
         })
     }
 
@@ -33,23 +37,48 @@ impl Engine {
         self
     }
 
-    fn programs(&self) -> Result<&Programs, String> {
-        self.programs
-            .as_ref()
-            .ok_or_else(|| "this helper cannot change the firewall".to_string())
+    pub fn with_anchors(mut self, anchors: Option<Box<dyn Anchors>>) -> Self {
+        self.anchors = anchors;
+        self
     }
 
-    fn holds_program(&self, program: &str) -> Option<bool> {
+    fn anchors(&self) -> Result<&dyn Anchors, String> {
+        self.anchors.as_deref().ok_or_else(|| {
+            "this helper cannot trust certificate authorities on this system".to_string()
+        })
+    }
+
+    fn firewall(&self) -> Result<(&Programs, &dyn AppFirewall), String> {
+        let refused = || "this helper cannot change the firewall".to_string();
+        let programs = self.programs.as_ref().ok_or_else(refused)?;
+        let firewall = programs.firewall.as_deref().ok_or_else(refused)?;
+        Ok((programs, firewall))
+    }
+
+    fn port_firewall(&self) -> Option<(&Programs, &dyn PortFirewall)> {
+        let programs = self.programs.as_ref()?;
+        Some((programs, programs.port_firewall.as_deref()?))
+    }
+
+    fn low_ports(&self) -> Result<(&Programs, &dyn PortGrant), String> {
+        let refused = || "this helper cannot grant low ports on this system".to_string();
+        let programs = self.programs.as_ref().ok_or_else(refused)?;
+        let grant = programs.low_ports.as_deref().ok_or_else(refused)?;
+        Ok((programs, grant))
+    }
+
+    fn held(&self, kept: impl Fn(&Change) -> Option<bool>) -> Option<bool> {
         self.journal
             .entries()
             .iter()
-            .find_map(|entry| match &entry.change {
-                Change::Firewall {
-                    program: held,
-                    keep,
-                } if held == program => Some(*keep),
-                _ => None,
-            })
+            .find_map(|entry| kept(&entry.change))
+    }
+
+    fn shared(&self, id: &str, same: impl Fn(&Change) -> bool) -> bool {
+        self.journal
+            .entries()
+            .iter()
+            .any(|other| other.id != id && same(&other.change))
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -70,21 +99,85 @@ impl Engine {
 
     pub fn apply(&mut self, owner: &str, scope: Scope, change: Change) -> Result<Entry, String> {
         menu::check(owner, scope, &change)?;
-        let mut allow = false;
+        let mut act = false;
         let change = match change {
-            Change::Firewall { program, .. } => {
-                let programs = self.programs()?;
+            Change::Firewall { program, ports, .. } if self.port_firewall().is_some() => {
+                let (programs, firewall) = self.port_firewall().expect("checked above");
                 let program = programs.resolve(&program)?;
-                let keep = match self.holds_program(&program) {
+                let mut opened = Vec::new();
+                if firewall.enabled()? {
+                    for port in &ports {
+                        let held = self.journal.entries().iter().any(|entry| {
+                            matches!(&entry.change, Change::Firewall { ports: held, .. } if held.contains(port))
+                        });
+                        if !held && !firewall.is_open(port)? {
+                            opened.push(port.clone());
+                        }
+                    }
+                }
+                Change::Firewall {
+                    program,
+                    ports,
+                    keep: opened.is_empty(),
+                    opened,
+                }
+            }
+            Change::Firewall { program, ports, .. } => {
+                let (programs, firewall) = self.firewall()?;
+                let program = programs.resolve(&program)?;
+                let held = self.held(|change| match change {
+                    Change::Firewall {
+                        program: held,
+                        keep,
+                        ..
+                    } if *held == program => Some(*keep),
+                    _ => None,
+                });
+                let keep = match held {
                     Some(keep) => keep,
                     None => {
-                        let keep =
-                            !programs.firewall.enabled()? || programs.firewall.listed(&program)?;
-                        allow = !keep;
+                        let keep = !firewall.enabled()? || firewall.listed(&program)?;
+                        act = !keep;
                         keep
                     }
                 };
-                Change::Firewall { program, keep }
+                Change::Firewall {
+                    program,
+                    ports,
+                    keep,
+                    opened: Vec::new(),
+                }
+            }
+            Change::LowPorts { program, .. } => {
+                let (programs, grant) = self.low_ports()?;
+                let program = programs.resolve(&program)?;
+                let held = self.held(|change| match change {
+                    Change::LowPorts {
+                        program: held,
+                        keep,
+                    } if *held == program => Some(*keep),
+                    _ => None,
+                });
+                let keep = match held {
+                    Some(keep) => keep,
+                    None => {
+                        let keep = grant.granted(&program)?;
+                        act = !keep;
+                        keep
+                    }
+                };
+                Change::LowPorts { program, keep }
+            }
+            Change::TrustCa {
+                certificate, names, ..
+            } => {
+                let ca = menu::check_certificate(&certificate, &names, (now_ms() / 1000) as i64)?;
+                self.anchors()?;
+                Change::TrustCa {
+                    certificate: cabinet_cartridge::ca::pem(&ca.der),
+                    names,
+                    anchor: String::new(),
+                }
             }
             other => other,
         };
@@ -117,17 +210,43 @@ impl Engine {
                     }
                 }
             }
-            Change::Firewall { .. } => {}
+            Change::Firewall { .. } | Change::LowPorts { .. } | Change::TrustCa { .. } => {}
         }
-        let entry = self.journal.add(owner, scope, change, now_ms())?;
+        let mut entry = self.journal.add(owner, scope, change, now_ms())?;
+        if matches!(entry.change, Change::TrustCa { .. }) {
+            let path = self.anchors().and_then(|anchors| anchors.path(&entry.id));
+            let recorded = path.and_then(|path| {
+                if let Change::TrustCa { anchor, .. } = &mut entry.change {
+                    *anchor = path;
+                }
+                self.journal.replace(entry.clone())
+            });
+            if let Err(err) = recorded {
+                if let Err(journal) = self.journal.remove(&entry.id) {
+                    log::error!("cannot drop the journal entry for a failed change: {journal}");
+                }
+                return Err(err);
+            }
+        }
         let applied = match &entry.change {
             Change::Hosts { names, target } => {
                 self.rewrite_hosts(|text| hosts::add(text, &entry.id, names, *target))
             }
-            Change::Firewall { program, .. } if allow => self
-                .programs()
-                .and_then(|programs| programs.firewall.allow(program)),
-            Change::Firewall { .. } => Ok(()),
+            Change::Firewall { opened, .. } if !opened.is_empty() => self.open_ports(opened),
+            Change::Firewall { program, .. } if act => self
+                .firewall()
+                .and_then(|(_, firewall)| firewall.allow(program)),
+            Change::LowPorts { program, .. } if act => {
+                self.low_ports().and_then(|(_, grant)| grant.grant(program))
+            }
+            Change::TrustCa {
+                certificate,
+                anchor,
+                ..
+            } => self
+                .anchors()
+                .and_then(|anchors| anchors.place(anchor, certificate)),
+            Change::Firewall { .. } | Change::LowPorts { .. } => Ok(()),
         };
         if let Err(err) = applied {
             if let Err(journal) = self.journal.remove(&entry.id) {
@@ -144,19 +263,89 @@ impl Engine {
         Ok(entry)
     }
 
+    fn open_ports(&self, ports: &[crate::protocol::Port]) -> Result<(), String> {
+        let (_, firewall) = self
+            .port_firewall()
+            .ok_or_else(|| "this helper cannot change the firewall".to_string())?;
+        for (index, port) in ports.iter().enumerate() {
+            if let Err(err) = firewall.open(port) {
+                for opened in &ports[..index] {
+                    if let Err(close) = firewall.close(opened) {
+                        log::error!("cannot close port {} again: {close}", opened.port);
+                    }
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn close_ports(&mut self, id: &str, opened: &[crate::protocol::Port]) -> Result<(), String> {
+        let mut closing = Vec::new();
+        for port in opened {
+            let heir = self
+                .journal
+                .entries()
+                .iter()
+                .find(|other| {
+                    other.id != id
+                        && matches!(&other.change, Change::Firewall { ports, .. } if ports.contains(port))
+                })
+                .cloned();
+            match heir {
+                Some(mut heir) => {
+                    if let Change::Firewall { opened, keep, .. } = &mut heir.change {
+                        if !opened.contains(port) {
+                            opened.push(port.clone());
+                        }
+                        *keep = false;
+                    }
+                    self.journal.replace(heir)?;
+                }
+                None => closing.push(port.clone()),
+            }
+        }
+        let (_, firewall) = self
+            .port_firewall()
+            .ok_or_else(|| "this helper cannot change the firewall".to_string())?;
+        for port in &closing {
+            firewall.close(port)?;
+        }
+        Ok(())
+    }
+
     pub fn undo(&mut self, id: &str) -> Result<(), String> {
         let Some(entry) = self.journal.entry(id).cloned() else {
             return Ok(());
         };
         match &entry.change {
             Change::Hosts { .. } => self.rewrite_hosts(|text| hosts::remove(text, &entry.id))?,
-            Change::Firewall { program, keep } => {
-                let shared = self.journal.entries().iter().any(|other| {
-                    other.id != entry.id
-                        && matches!(&other.change, Change::Firewall { program: held, .. } if held == program)
+            Change::Firewall { opened, .. } if !opened.is_empty() => {
+                self.close_ports(&entry.id, opened)?
+            }
+            Change::Firewall { program, keep, .. } => {
+                let shared = self.shared(&entry.id, |other| {
+                    matches!(other, Change::Firewall { program: held, .. } if held == program)
                 });
                 if !keep && !shared {
-                    self.programs()?.firewall.remove(program)?;
+                    self.firewall()?.1.remove(program)?;
+                }
+            }
+            Change::LowPorts { program, keep } => {
+                let shared = self.shared(&entry.id, |other| {
+                    matches!(other, Change::LowPorts { program: held, .. } if held == program)
+                });
+                if !keep && !shared {
+                    self.low_ports()?.1.revoke(program)?;
+                }
+            }
+            Change::TrustCa {
+                certificate,
+                anchor,
+                ..
+            } => {
+                if !anchor.is_empty() {
+                    self.anchors()?.remove(anchor, certificate)?;
                 }
             }
         }
@@ -245,14 +434,18 @@ pub(crate) mod tests {
     fn firewall(program: &str) -> Change {
         Change::Firewall {
             program: program.to_string(),
+            ports: Vec::new(),
             keep: false,
+            opened: Vec::new(),
         }
     }
 
     #[cfg(unix)]
     fn with_firewall(scratch: &Scratch, fake: &crate::firewall::tests::FakeFirewall) -> Engine {
         scratch.engine().with_programs(Some(Programs {
-            firewall: Box::new(fake.clone()),
+            firewall: Some(Box::new(fake.clone())),
+            port_firewall: None,
+            low_ports: None,
             root: scratch.0.clone(),
             uid: None,
         }))
@@ -302,7 +495,9 @@ pub(crate) mod tests {
             entry.change,
             Change::Firewall {
                 program: program.clone(),
-                keep: true
+                ports: Vec::new(),
+                keep: true,
+                opened: Vec::new(),
             }
         );
         engine.undo(&entry.id).unwrap();
@@ -315,6 +510,178 @@ pub(crate) mod tests {
             .unwrap();
         assert!(fake.apps.lock().unwrap().is_empty());
         engine.undo(&entry.id).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ports_are_opened_for_their_sessions_and_closed_with_the_last_one() {
+        use crate::protocol::{Port, Proto};
+        let scratch = Scratch::new("ports");
+        let fake = crate::firewall::tests::FakePorts::default();
+        let program = program(&scratch);
+        let engine = |scratch: &Scratch| {
+            scratch.engine().with_programs(Some(Programs {
+                firewall: None,
+                port_firewall: Some(Box::new(fake.clone())),
+                low_ports: None,
+                root: scratch.0.clone(),
+                uid: None,
+            }))
+        };
+        let tcp = |port| Port {
+            proto: Proto::Tcp,
+            port,
+        };
+        let allow = |ports: Vec<Port>| Change::Firewall {
+            program: program.clone(),
+            ports,
+            keep: false,
+            opened: Vec::new(),
+        };
+        let mut helper = engine(&scratch);
+        let first = helper
+            .apply(OWNER, Scope::Session, allow(vec![tcp(987), tcp(55435)]))
+            .unwrap();
+        let second = helper
+            .apply(OWNER, Scope::Session, allow(vec![tcp(987)]))
+            .unwrap();
+        assert_eq!(*fake.open.lock().unwrap(), vec![tcp(987), tcp(55435)]);
+        helper.undo(&first.id).unwrap();
+        assert_eq!(*fake.open.lock().unwrap(), vec![tcp(987)]);
+        helper.undo(&second.id).unwrap();
+        assert!(fake.open.lock().unwrap().is_empty());
+        assert!(helper.entries().is_empty());
+
+        fake.open.lock().unwrap().push(tcp(22));
+        let kept = helper
+            .apply(OWNER, Scope::Session, allow(vec![tcp(22), tcp(987)]))
+            .unwrap();
+        assert_eq!(*fake.open.lock().unwrap(), vec![tcp(22), tcp(987)]);
+        let mut restarted = engine(&scratch);
+        let (undone, failures) = restarted.sweep(|_| false);
+        assert_eq!((undone, failures.len()), (1, 0));
+        assert_eq!(*fake.open.lock().unwrap(), vec![tcp(22)]);
+        let _ = kept;
+
+        *fake.off.lock().unwrap() = true;
+        let off = restarted
+            .apply(OWNER, Scope::Session, allow(vec![tcp(987)]))
+            .unwrap();
+        assert!(
+            matches!(&off.change, Change::Firewall { opened, keep: true, .. } if opened.is_empty())
+        );
+        restarted.undo(&off.id).unwrap();
+        assert_eq!(*fake.open.lock().unwrap(), vec![tcp(22)]);
+        assert!(restarted
+            .apply(OWNER, Scope::Session, allow(vec![tcp(987)]))
+            .map(|entry| entry.change)
+            .is_ok());
+        assert!(engine(&scratch)
+            .apply(
+                OWNER,
+                Scope::Session,
+                Change::Firewall {
+                    program: "/bin/sh".to_string(),
+                    ports: vec![tcp(987)],
+                    keep: false,
+                    opened: Vec::new(),
+                }
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn a_certificate_authority_is_placed_for_its_install_and_removed_with_it() {
+        let scratch = Scratch::new("trust");
+        let anchors = crate::anchors::tests::anchors(&scratch);
+        let dir = anchors.dir.clone();
+        let mut engine = scratch.engine().with_anchors(Some(Box::new(anchors)));
+        let trust = |names: &[&str]| Change::TrustCa {
+            certificate: include_str!("../../cartridge/src/fixtures/ca-good.pem").to_string(),
+            names: names.iter().map(|name| name.to_string()).collect(),
+            anchor: String::new(),
+        };
+        let entry = engine.apply(OWNER, Scope::Install, trust(&[NAME])).unwrap();
+        let Change::TrustCa {
+            certificate,
+            anchor,
+            ..
+        } = &entry.change
+        else {
+            panic!("{entry:?}");
+        };
+        assert_eq!(engine.entries()[0], entry);
+        assert_eq!(std::fs::read_to_string(anchor).unwrap(), *certificate);
+        assert!(anchor.starts_with(dir.to_str().unwrap()));
+        let (undone, failures) = engine.sweep(|_| false);
+        assert_eq!((undone, failures.len()), (0, 0));
+        assert!(std::path::Path::new(anchor).exists());
+        let (undone, failures) = engine.undo_where(|held| held.owner == OWNER);
+        assert_eq!((undone, failures.len()), (1, 0));
+        assert!(!std::path::Path::new(anchor).exists());
+        assert!(engine.entries().is_empty());
+
+        assert!(engine
+            .apply(OWNER, Scope::Install, trust(&["other.invalid"]))
+            .is_err());
+        let mut plain = scratch.engine();
+        assert!(plain.apply(OWNER, Scope::Install, trust(&[NAME])).is_err());
+        assert!(plain.entries().is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn low_ports_are_granted_for_their_sessions_and_kept_when_already_there() {
+        let scratch = Scratch::new("low");
+        let grant = crate::lowports::tests::FakeGrant::default();
+        let program = program(&scratch);
+        let mut engine = scratch.engine().with_programs(Some(Programs {
+            firewall: None,
+            port_firewall: None,
+            low_ports: Some(Box::new(grant.clone())),
+            root: scratch.0.clone(),
+            uid: None,
+        }));
+        let low = |program: &str| Change::LowPorts {
+            program: program.to_string(),
+            keep: false,
+        };
+        let first = engine.apply(OWNER, Scope::Session, low(&program)).unwrap();
+        let second = engine.apply(OWNER, Scope::Session, low(&program)).unwrap();
+        assert_eq!(*grant.programs.lock().unwrap(), vec![program.clone()]);
+        engine.undo(&first.id).unwrap();
+        assert_eq!(grant.programs.lock().unwrap().len(), 1);
+        engine.undo(&second.id).unwrap();
+        assert!(grant.programs.lock().unwrap().is_empty());
+
+        engine.apply(OWNER, Scope::Session, low(&program)).unwrap();
+        let mut engine = scratch.engine().with_programs(Some(Programs {
+            firewall: None,
+            port_firewall: None,
+            low_ports: Some(Box::new(grant.clone())),
+            root: scratch.0.clone(),
+            uid: None,
+        }));
+        let (undone, failures) = engine.sweep(|_| false);
+        assert_eq!((undone, failures.len()), (1, 0));
+        assert!(grant.programs.lock().unwrap().is_empty());
+
+        grant.programs.lock().unwrap().push(program.clone());
+        let kept = engine.apply(OWNER, Scope::Session, low(&program)).unwrap();
+        assert_eq!(
+            kept.change,
+            Change::LowPorts {
+                program: program.clone(),
+                keep: true,
+            }
+        );
+        engine.undo(&kept.id).unwrap();
+        assert_eq!(*grant.programs.lock().unwrap(), vec![program.clone()]);
+
+        assert!(engine.apply(OWNER, Scope::Session, low("/bin/sh")).is_err());
+        let mut plain = scratch.engine();
+        assert!(plain.apply(OWNER, Scope::Session, low(&program)).is_err());
     }
 
     #[cfg(unix)]

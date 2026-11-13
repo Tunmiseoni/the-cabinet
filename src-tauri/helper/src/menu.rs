@@ -4,6 +4,9 @@ use std::net::Ipv4Addr;
 pub const PROVEN_HOSTS: Option<&[&str]> = Some(&["cabinet-test.invalid"]);
 pub const MAX_HOSTS_NAMES: usize = 32;
 pub const MAX_PROGRAM_PATH: usize = 1024;
+pub const MAX_PORTS: usize = 16;
+pub const MAX_CERTIFICATE: usize = 16 * 1024;
+const PEM_START: &str = "-----BEGIN CERTIFICATE-----";
 const RESERVED: &[&str] = &["localhost", "broadcasthost"];
 
 pub fn is_dns_name(value: &str) -> bool {
@@ -77,27 +80,112 @@ pub fn check(owner: &str, scope: Scope, change: &Change) -> Result<(), String> {
             }
             Ok(())
         }
-        Change::Firewall { program, keep } => {
+        Change::Firewall {
+            program,
+            ports,
+            keep,
+            opened,
+        } => {
             if scope != Scope::Session {
                 return Err("firewall allowances are session-scoped".to_string());
+            }
+            if *keep || !opened.is_empty() {
+                return Err("only the helper decides what it keeps".to_string());
+            }
+            check_program(program)?;
+            if ports.len() > MAX_PORTS {
+                return Err(format!(
+                    "a firewall allowance takes at most {MAX_PORTS} ports"
+                ));
+            }
+            for (index, port) in ports.iter().enumerate() {
+                if port.port == 0 {
+                    return Err("port 0 cannot be allowed".to_string());
+                }
+                if ports[..index].contains(port) {
+                    return Err(format!("port {} is listed twice", port.port));
+                }
+            }
+            Ok(())
+        }
+        Change::LowPorts { program, keep } => {
+            if scope != Scope::Session {
+                return Err("low ports are session-scoped".to_string());
             }
             if *keep {
                 return Err("only the helper decides what it keeps".to_string());
             }
-            if !program.starts_with('/')
-                || program.len() > MAX_PROGRAM_PATH
-                || program.chars().any(char::is_control)
+            check_program(program)
+        }
+        Change::TrustCa {
+            certificate,
+            names,
+            anchor,
+        } => {
+            if scope != Scope::Install {
+                return Err("certificate authorities are install-scoped".to_string());
+            }
+            if !anchor.is_empty() {
+                return Err("only the helper decides where a certificate goes".to_string());
+            }
+            if certificate.len() > MAX_CERTIFICATE
+                || !certificate.trim_start().starts_with(PEM_START)
             {
-                return Err("the program is not an absolute path".to_string());
+                return Err("the certificate is not a single PEM certificate".to_string());
+            }
+            if names.is_empty() || names.len() > MAX_HOSTS_NAMES {
+                return Err(format!(
+                    "a certificate authority takes 1 to {MAX_HOSTS_NAMES} names, not {}",
+                    names.len()
+                ));
+            }
+            for name in names {
+                if !is_dns_name(name) {
+                    return Err(format!("\"{name}\" is not a lowercase DNS name"));
+                }
+                if PROVEN_HOSTS.is_some_and(|allowed| !allowed.contains(&name.as_str())) {
+                    return Err(format!(
+                        "\"{name}\" is not allowed yet: this helper only trusts authorities for its test name"
+                    ));
+                }
             }
             Ok(())
         }
     }
 }
 
+fn check_program(program: &str) -> Result<(), String> {
+    if !program.starts_with('/') && !is_windows_absolute(program)
+        || program.len() > MAX_PROGRAM_PATH
+        || program.chars().any(char::is_control)
+    {
+        return Err("the program is not an absolute path".to_string());
+    }
+    Ok(())
+}
+
+fn is_windows_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    cfg!(windows)
+        && bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+}
+
+pub fn check_certificate(
+    certificate: &str,
+    names: &[String],
+    now: i64,
+) -> Result<cabinet_cartridge::ca::Ca, String> {
+    cabinet_cartridge::ca::check(certificate.as_bytes(), names, now)
+        .map_err(|err| format!("the certificate authority is refused: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{Port, Proto};
 
     fn hosts(names: &[&str], target: &str) -> Change {
         Change::Hosts {
@@ -182,16 +270,117 @@ mod tests {
     fn firewall_requests_name_one_absolute_program_for_a_session() {
         let firewall = |program: &str, keep: bool| Change::Firewall {
             program: program.to_string(),
+            ports: Vec::new(),
             keep,
+            opened: Vec::new(),
         };
         check(OWNER, Scope::Session, &firewall("/a/b", false)).unwrap();
         assert!(check(OWNER, Scope::Install, &firewall("/a/b", false)).is_err());
         assert!(check(OWNER, Scope::Session, &firewall("/a/b", true)).is_err());
+        let opened = Change::Firewall {
+            program: "/a/b".to_string(),
+            ports: Vec::new(),
+            keep: false,
+            opened: vec![Port {
+                proto: Proto::Tcp,
+                port: 987,
+            }],
+        };
+        assert!(check(OWNER, Scope::Session, &opened).is_err());
         for program in ["", "a/b", "/a\nb", &format!("/{}", "a".repeat(2000))] {
             assert!(
                 check(OWNER, Scope::Session, &firewall(program, false)).is_err(),
                 "{program}"
             );
         }
+    }
+
+    fn port(port: u16) -> Port {
+        Port {
+            proto: Proto::Tcp,
+            port,
+        }
+    }
+
+    #[test]
+    fn firewall_ports_are_bounded_and_distinct() {
+        let firewall = |ports: Vec<Port>| Change::Firewall {
+            program: "/a/b".to_string(),
+            ports,
+            keep: false,
+            opened: Vec::new(),
+        };
+        check(
+            OWNER,
+            Scope::Session,
+            &firewall(vec![port(987), port(55435)]),
+        )
+        .unwrap();
+        for ports in [
+            vec![port(0)],
+            vec![port(987), port(987)],
+            (1..=MAX_PORTS as u16 + 1).map(port).collect(),
+        ] {
+            assert!(
+                check(OWNER, Scope::Session, &firewall(ports.clone())).is_err(),
+                "{ports:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn low_ports_name_one_absolute_program_for_a_session() {
+        let low = |program: &str| Change::LowPorts {
+            program: program.to_string(),
+            keep: false,
+        };
+        check(OWNER, Scope::Session, &low("/a/b")).unwrap();
+        assert!(check(OWNER, Scope::Install, &low("/a/b")).is_err());
+        assert!(check(OWNER, Scope::Session, &low("a/b")).is_err());
+        let kept = Change::LowPorts {
+            program: "/a/b".to_string(),
+            keep: true,
+        };
+        assert!(check(OWNER, Scope::Session, &kept).is_err());
+    }
+
+    const GOOD: &str = include_str!("../../cartridge/src/fixtures/ca-good.pem");
+
+    fn trust(names: &[&str], anchor: &str) -> Change {
+        Change::TrustCa {
+            certificate: GOOD.to_string(),
+            names: names.iter().map(|name| name.to_string()).collect(),
+            anchor: anchor.to_string(),
+        }
+    }
+
+    #[test]
+    fn certificate_authorities_are_install_scoped_and_limited_to_the_test_name() {
+        check(OWNER, Scope::Install, &trust(&["cabinet-test.invalid"], "")).unwrap();
+        assert!(check(OWNER, Scope::Session, &trust(&["cabinet-test.invalid"], "")).is_err());
+        assert!(check(
+            OWNER,
+            Scope::Install,
+            &trust(&["cabinet-test.invalid"], "/etc/x")
+        )
+        .is_err());
+        assert!(check(OWNER, Scope::Install, &trust(&[], "")).is_err());
+        let err = check(OWNER, Scope::Install, &trust(&["example-game.net"], "")).unwrap_err();
+        assert!(err.contains("not allowed yet"), "{err}");
+        let der = Change::TrustCa {
+            certificate: "MIIB".to_string(),
+            names: vec!["cabinet-test.invalid".to_string()],
+            anchor: String::new(),
+        };
+        assert!(check(OWNER, Scope::Install, &der).is_err());
+    }
+
+    #[test]
+    fn the_helper_checks_the_certificate_itself() {
+        let now = 1_794_600_000;
+        let names = vec!["cabinet-test.invalid".to_string()];
+        check_certificate(GOOD, &names, now).unwrap();
+        let err = check_certificate(GOOD, &["other.invalid".to_string()], now).unwrap_err();
+        assert!(err.contains("refused"), "{err}");
     }
 }
