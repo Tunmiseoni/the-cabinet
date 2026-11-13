@@ -269,3 +269,52 @@ fn inspect_reports_a_manifest_error() {
         Err(Error::UnsupportedFormat(7))
     ));
 }
+
+#[test]
+fn pack_refuses_a_certificate_authority_that_does_not_match_its_declaration() {
+    let dir = std::env::temp_dir().join(format!("cabinet-pack-ca-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src/files")).unwrap();
+    let manifest = r#"format = 1
+id = "test"
+version = "0.1.0"
+title = "Test"
+min_cabinet = "0.1.0"
+platforms = ["macos-aarch64"]
+
+[programs.main.run]
+macos-aarch64 = "files/main"
+
+[lifecycle.session]
+program = "main"
+
+[[assets]]
+id = "ca"
+file = "files/ca.pem"
+
+[capabilities.trust_ca]
+asset = "ca"
+permitted_names = ["cabinet-test.invalid"]
+scope = "install"
+stores = ["system"]
+"#;
+    std::fs::write(dir.join("src/cartridge.toml"), manifest).unwrap();
+    std::fs::write(dir.join("src/files/main"), "#!/bin/sh\n").unwrap();
+    let out = dir.join("test.cart");
+    std::fs::write(
+        dir.join("src/files/ca.pem"),
+        include_bytes!("fixtures/ca-unconstrained.pem"),
+    )
+    .unwrap();
+    let err = crate::archive::pack(&dir.join("src"), &out, None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no name constraints"), "{err}");
+    std::fs::write(
+        dir.join("src/files/ca.pem"),
+        include_bytes!("fixtures/ca-good.pem"),
+    )
+    .unwrap();
+    crate::archive::pack(&dir.join("src"), &out, None).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -1,6 +1,7 @@
 #[cfg(unix)]
 pub mod client;
 pub mod engine;
+pub mod firewall;
 pub mod hosts;
 pub mod journal;
 pub mod menu;

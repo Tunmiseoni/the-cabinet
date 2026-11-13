@@ -1,5 +1,7 @@
 use super::*;
 use crate::cartridge::assets::tests::FakeFetch;
+use crate::cartridge::catrust::tests::FakeTrustStore;
+use crate::cartridge::catrust::CaState;
 use crate::cartridge::testing::{build_cart, CartSpec, Scratch};
 use crate::cartridge::trust::{Grant, Standing};
 use cabinet_cartridge::digest;
@@ -53,6 +55,8 @@ struct Fixture {
     store: Store,
     fetch: FakeFetch,
     approval: Approval,
+    now: u64,
+    trust: Option<std::sync::Arc<FakeTrustStore>>,
 }
 
 impl Fixture {
@@ -65,6 +69,8 @@ impl Fixture {
             store,
             fetch: FakeFetch::default(),
             approval: Approval::default(),
+            now: 1,
+            trust: None,
         }
     }
 
@@ -99,8 +105,9 @@ impl Fixture {
             platform: Platform::current().unwrap(),
             fetch: &self.fetch,
             log_dir: self.scratch.path("logs"),
-            now: 1,
+            now: self.now,
             busy: false,
+            trust: self.trust.as_deref().map(|trust| trust as &dyn TrustStore),
         }
         .install(cart, settings, &self.approval)
     }
@@ -136,6 +143,7 @@ fn setup_runs_after_the_footprint_snapshot_and_uninstall_restores_it() {
         Platform::current().unwrap(),
         &fixture.scratch.path("logs"),
         None,
+        None,
     )
     .unwrap();
     assert!(problems.is_empty(), "{problems:?}");
@@ -170,6 +178,7 @@ fn an_update_keeps_the_settings_and_the_original_snapshot() {
         &installed.cartridge,
         Platform::current().unwrap(),
         &fixture.scratch.path("logs"),
+        None,
         None,
     )
     .unwrap();
@@ -428,4 +437,357 @@ fn another_publisher_with_the_same_id_is_a_separate_cartridge() {
     assert_eq!(unknown.capabilities, Grant::Withheld);
     assert_eq!(fixture.store.registry().entries.len(), 2);
     assert_eq!(fixture.store.registry().publishers.len(), 1);
+}
+
+const CA_NOW: u64 = 1_794_600_000_000;
+const CA_GOOD: &[u8] = include_bytes!("../../../cartridge/src/fixtures/ca-good.pem");
+const CA_TWO: &[u8] = include_bytes!("../../../cartridge/src/fixtures/ca-two.pem");
+const CA_LOOSE: &[u8] = include_bytes!("../../../cartridge/src/fixtures/ca-unconstrained.pem");
+
+fn trusts_ca(names: &str) -> String {
+    format!(
+        r#"
+[[assets]]
+id = "ca"
+file = "files/ca.pem"
+
+[capabilities.trust_ca]
+asset = "ca"
+permitted_names = [{names}]
+scope = "install"
+stores = ["system"]
+"#
+    )
+}
+
+fn ca_cart(
+    fixture: &Fixture,
+    signer: &KeySigner,
+    version: &str,
+    names: &str,
+    ca: &[u8],
+) -> PathBuf {
+    build_cart(
+        &fixture.scratch,
+        &CartSpec {
+            version,
+            extra: &trusts_ca(names),
+            files: &[("files/ca.pem", ca)],
+            signer: Some(signer),
+            ..CartSpec::default()
+        },
+    )
+}
+
+fn ca_fixture(tag: &str) -> (Fixture, std::sync::Arc<FakeTrustStore>) {
+    let mut fixture = Fixture::new(tag);
+    let trust = std::sync::Arc::new(FakeTrustStore::default());
+    fixture.now = CA_NOW;
+    fixture.trust = Some(std::sync::Arc::clone(&trust));
+    (fixture, trust)
+}
+
+fn ca_state(fixture: &Fixture, installed: &Installed) -> CaState {
+    let entry = fixture.store.entry(&installed.cartridge).unwrap();
+    catrust::state(
+        entry,
+        &fixture.store.manifest(&installed.digest).unwrap(),
+        &fixture.store.unpacked(&installed.digest),
+        true,
+        CA_NOW,
+    )
+}
+
+const ONE_NAME: &str = "\"cabinet-test.invalid\"";
+const TWO_NAMES: &str = "\"cabinet-test.invalid\", \"other-test.invalid\"";
+
+#[test]
+fn a_granted_certificate_authority_is_trusted_at_install_and_removed_at_uninstall() {
+    let (mut fixture, trust) = ca_fixture("ca-install");
+    let signer = signer();
+    let cart = ca_cart(&fixture, &signer, "0.1.0", ONE_NAME, CA_GOOD);
+    fixture.approval = trusting("Friend");
+    let installed = fixture.install(&cart, None).unwrap();
+    assert_eq!(installed.capabilities, Grant::Granted);
+    assert_eq!(installed.ca_problem, None);
+    let recorded = fixture
+        .store
+        .entry(&installed.cartridge)
+        .unwrap()
+        .trusted_ca
+        .clone()
+        .unwrap();
+    assert_eq!(recorded.subject, "CN=Cabinet fixture good");
+    assert_eq!(*trust.held.lock().unwrap(), vec![recorded.sha256.clone()]);
+    assert_eq!(ca_state(&fixture, &installed), CaState::Ready);
+
+    *trust.refuse.lock().unwrap() = true;
+    let err = uninstall(
+        &mut fixture.store,
+        &installed.cartridge,
+        Platform::current().unwrap(),
+        &fixture.scratch.path("logs"),
+        None,
+        Some(&*trust),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("stays installed"), "{err}");
+    assert!(fixture.store.entry(&installed.cartridge).is_ok());
+    assert_eq!(trust.held.lock().unwrap().len(), 1);
+
+    *trust.refuse.lock().unwrap() = false;
+    uninstall(
+        &mut fixture.store,
+        &installed.cartridge,
+        Platform::current().unwrap(),
+        &fixture.scratch.path("logs"),
+        None,
+        Some(&*trust),
+    )
+    .unwrap();
+    assert!(trust.held.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_certificate_authority_that_does_not_match_its_declaration_fails_the_install() {
+    let (mut fixture, trust) = ca_fixture("ca-mismatch");
+    let signer = signer();
+    fixture.approval = trusting("Friend");
+    for (version, names, ca) in [
+        ("0.1.0", ONE_NAME, CA_LOOSE),
+        ("0.1.1", ONE_NAME, CA_TWO),
+        ("0.1.2", TWO_NAMES, CA_GOOD),
+    ] {
+        let cart = ca_cart(&fixture, &signer, version, names, ca);
+        let err = fixture.install(&cart, None).unwrap_err().to_string();
+        assert!(err.contains("certificate authority is refused"), "{err}");
+    }
+    assert!(fixture.store.registry().entries.is_empty());
+    assert!(trust.held.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_withheld_or_refused_certificate_authority_is_not_trusted_and_blocks_sessions() {
+    let (mut fixture, trust) = ca_fixture("ca-withheld");
+    let signer = signer();
+    let cart = ca_cart(&fixture, &signer, "0.1.0", ONE_NAME, CA_GOOD);
+    let installed = fixture.install(&cart, None).unwrap();
+    assert_eq!(installed.capabilities, Grant::Withheld);
+    assert!(trust.held.lock().unwrap().is_empty());
+    assert!(matches!(
+        ca_state(&fixture, &installed),
+        CaState::Missing(_)
+    ));
+
+    *trust.refuse.lock().unwrap() = true;
+    fixture.approval = trusting("Friend");
+    let installed = fixture.install(&cart, None).unwrap();
+    assert_eq!(installed.capabilities, Grant::Granted);
+    assert!(installed.ca_problem.as_ref().unwrap().contains("cancelled"));
+    assert!(fixture
+        .store
+        .entry(&installed.cartridge)
+        .unwrap()
+        .trusted_ca
+        .is_none());
+    assert!(matches!(
+        ca_state(&fixture, &installed),
+        CaState::Missing(_)
+    ));
+
+    *trust.refuse.lock().unwrap() = false;
+    catrust::reconcile(
+        &mut fixture.store,
+        &installed.cartridge,
+        &*trust,
+        true,
+        CA_NOW,
+    )
+    .unwrap();
+    assert_eq!(trust.held.lock().unwrap().len(), 1);
+    assert_eq!(ca_state(&fixture, &installed), CaState::Ready);
+}
+
+#[test]
+fn forgetting_the_publisher_or_changing_the_certificate_authority_updates_the_trust() {
+    let (mut fixture, trust) = ca_fixture("ca-change");
+    let signer = signer();
+    fixture.approval = trusting("Friend");
+    let first = fixture
+        .install(
+            &ca_cart(&fixture, &signer, "0.1.0", ONE_NAME, CA_GOOD),
+            None,
+        )
+        .unwrap();
+    let old = trust.held.lock().unwrap().clone();
+    let second = fixture
+        .install(
+            &ca_cart(&fixture, &signer, "0.2.0", TWO_NAMES, CA_TWO),
+            None,
+        )
+        .unwrap();
+    assert_eq!(second.ca_problem, None);
+    let new = trust.held.lock().unwrap().clone();
+    assert_eq!(new.len(), 1);
+    assert_ne!(new, old);
+    assert!(matches!(ca_state(&fixture, &first), CaState::Missing(_)));
+    assert_eq!(ca_state(&fixture, &second), CaState::Ready);
+
+    fixture
+        .store
+        .forget_publisher(&signer.publisher().fingerprint())
+        .unwrap();
+    let problems = catrust::reconcile_all(&mut fixture.store, &*trust, false, CA_NOW);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert!(trust.held.lock().unwrap().is_empty());
+    assert!(fixture
+        .store
+        .entry(&second.cartridge)
+        .unwrap()
+        .trusted_ca
+        .is_none());
+}
+
+#[cfg(target_os = "macos")]
+fn openssl(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("/usr/bin/openssl")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "openssl {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn throwaway_ca(dir: &Path) -> Vec<u8> {
+    std::fs::write(
+        dir.join("ca.cnf"),
+        "[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN=Cabinet throwaway test CA\n[v3]\nbasicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nnameConstraints=critical,permitted;DNS:cabinet-test.invalid,excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0\n",
+    )
+    .unwrap();
+    openssl(
+        dir,
+        &[
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem",
+            "-days", "2", "-config", "ca.cnf",
+        ],
+    );
+    for (leaf, name) in [
+        ("inside", "cabinet-test.invalid"),
+        ("outside", "other-test.invalid"),
+    ] {
+        std::fs::write(
+            dir.join(format!("{leaf}.ext")),
+            format!("basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:{name}\n"),
+        )
+        .unwrap();
+        let (key, csr, pem, ext) = (
+            format!("{leaf}.key"),
+            format!("{leaf}.csr"),
+            format!("{leaf}.pem"),
+            format!("{leaf}.ext"),
+        );
+        let subject = format!("/CN={name}");
+        openssl(
+            dir,
+            &[
+                "req", "-newkey", "rsa:2048", "-nodes", "-keyout", &key, "-out", &csr, "-subj",
+                &subject,
+            ],
+        );
+        openssl(
+            dir,
+            &[
+                "x509",
+                "-req",
+                "-in",
+                &csr,
+                "-CA",
+                "ca.pem",
+                "-CAkey",
+                "ca.key",
+                "-CAcreateserial",
+                "-out",
+                &pem,
+                "-days",
+                "1",
+                "-extfile",
+                &ext,
+            ],
+        );
+        std::fs::remove_file(dir.join(key)).unwrap();
+    }
+    std::fs::remove_file(dir.join("ca.key")).unwrap();
+    std::fs::read(dir.join("ca.pem")).unwrap()
+}
+
+#[cfg(target_os = "macos")]
+fn verifies(dir: &Path, leaf: &str, name: &str) -> bool {
+    std::process::Command::new("/usr/bin/security")
+        .args(["verify-cert", "-L", "-p", "ssl", "-n", name, "-c"])
+        .arg(dir.join(format!("{leaf}.pem")))
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "trusts a throwaway certificate authority in the login keychain; macOS asks for a password twice"]
+fn the_login_keychain_trusts_a_cartridge_certificate_authority_while_it_is_installed() {
+    let keychain = catrust::Keychain;
+    let mut fixture = Fixture::new("ca-live");
+    fixture.now = crate::time::now_ms();
+    let dir = fixture.scratch.path("ca");
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca = throwaway_ca(&dir);
+    assert!(!verifies(&dir, "inside", "cabinet-test.invalid"));
+
+    let signer = signer();
+    let cart = ca_cart(&fixture, &signer, "0.1.0", ONE_NAME, &ca);
+    let installed = Installer {
+        store: &mut fixture.store,
+        cabinet: Version::new(0, 1, 15),
+        platform: Platform::current().unwrap(),
+        fetch: &fixture.fetch,
+        log_dir: fixture.scratch.path("logs"),
+        now: fixture.now,
+        busy: false,
+        trust: Some(&keychain),
+    }
+    .install(&cart, None, &trusting("Friend"))
+    .unwrap();
+    assert_eq!(installed.ca_problem, None);
+    let recorded = fixture
+        .store
+        .entry(&installed.cartridge)
+        .unwrap()
+        .trusted_ca
+        .clone()
+        .unwrap();
+    let outcome = std::panic::catch_unwind(|| {
+        assert!(keychain.holds(&recorded.sha256).unwrap());
+        assert!(verifies(&dir, "inside", "cabinet-test.invalid"));
+        assert!(!verifies(&dir, "outside", "other-test.invalid"));
+        assert!(!verifies(&dir, "inside", "other-test.invalid"));
+    });
+
+    uninstall(
+        &mut fixture.store,
+        &installed.cartridge,
+        Platform::current().unwrap(),
+        &fixture.scratch.path("logs"),
+        None,
+        Some(&keychain),
+    )
+    .unwrap();
+    assert!(!keychain.holds(&recorded.sha256).unwrap());
+    assert!(!verifies(&dir, "inside", "cabinet-test.invalid"));
+    outcome.unwrap();
 }

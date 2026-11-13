@@ -126,6 +126,7 @@ pub fn run() {
             }
 
             commands::helper::sweep_on_startup();
+            commands::cartridge::reconcile_cas_on_startup(app.handle());
 
             let verbose = verbose_logging_requested(app.handle());
             log::set_max_level(if verbose {
@@ -177,6 +178,7 @@ pub fn run() {
             commands::cartridge::cartridge_trust_publisher,
             commands::cartridge::cartridge_forget_publisher,
             commands::cartridge::cartridge_approve_capabilities,
+            commands::cartridge::cartridge_trust_ca,
             commands::cartridge::cartridge_host,
             commands::cartridge::cartridge_join,
             commands::cartridge::cartridge_start,

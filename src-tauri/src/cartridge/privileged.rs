@@ -1,6 +1,7 @@
+use super::catrust::CaState;
 use super::registry::CartridgeRef;
 use super::trust::{self, Grant};
-use cabinet_cartridge::manifest::Capabilities;
+use cabinet_cartridge::manifest::{Capabilities, Scope as ManifestScope, Store as CaStore};
 use cabinet_helper::protocol::Change;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::Arc;
@@ -38,29 +39,80 @@ pub fn service_ip(address: &str) -> Result<Ipv4Addr, String> {
         .ok_or_else(|| format!("cannot redirect names to \"{address}\": it has no IPv4 address"))
 }
 
-pub fn session_changes(capabilities: &Capabilities, service: Ipv4Addr) -> Vec<Change> {
-    capabilities
-        .hosts
-        .iter()
-        .map(|hosts| Change::Hosts {
+pub fn session_changes(
+    capabilities: &Capabilities,
+    service: &str,
+    programs: &[String],
+) -> Result<Vec<Change>, String> {
+    let mut changes = Vec::new();
+    if let Some(hosts) = &capabilities.hosts {
+        changes.push(Change::Hosts {
             names: hosts.names.clone(),
-            target: service,
-        })
-        .collect()
+            target: service_ip(service)?,
+        });
+    }
+    if capabilities.firewall.is_some() {
+        changes.extend(programs.iter().map(|program| Change::Firewall {
+            program: program.clone(),
+            keep: false,
+        }));
+    }
+    Ok(changes)
+}
+
+fn settled(capabilities: &Capabilities) -> Vec<&'static str> {
+    let mut items = Vec::new();
+    if cfg!(target_os = "macos") {
+        if !capabilities.low_ports.is_empty() {
+            items.push("low_ports");
+        }
+        if capabilities
+            .trust_ca
+            .as_ref()
+            .is_some_and(|ca| ca.stores == [CaStore::System])
+        {
+            items.push("trust_ca");
+        }
+        if capabilities
+            .firewall
+            .as_ref()
+            .is_some_and(|firewall| firewall.scope == ManifestScope::Session)
+        {
+            items.push("firewall");
+        }
+    }
+    items
 }
 
 fn unsupported(capabilities: &Capabilities) -> Vec<&'static str> {
     let mut items = Vec::new();
-    if !capabilities.low_ports.is_empty() {
+    let settled = settled(capabilities);
+    if !capabilities.low_ports.is_empty() && !settled.contains(&"low_ports") {
         items.push("low_ports");
     }
-    if capabilities.trust_ca.is_some() {
-        items.push("trust_ca");
+    if let Some(ca) = &capabilities.trust_ca {
+        if !settled.contains(&"trust_ca") {
+            items.push(if ca.stores.contains(&CaStore::Bottle) {
+                "trust_ca (bottle store)"
+            } else {
+                "trust_ca"
+            });
+        }
     }
-    if capabilities.firewall.is_some() {
+    if capabilities.firewall.is_some() && !settled.contains(&"firewall") {
         items.push("firewall");
     }
     items
+}
+
+fn through_helper(capabilities: &Capabilities) -> bool {
+    capabilities.hosts.is_some() || capabilities.firewall.is_some()
+}
+
+enum Route<'a> {
+    Nothing,
+    Skipped,
+    Helper(&'a SharedHelper),
 }
 
 pub struct Privileges {
@@ -69,6 +121,8 @@ pub struct Privileges {
     title: String,
     capabilities: Capabilities,
     grant: Grant,
+    ca: CaState,
+    programs: Vec<String>,
     lease: Option<Box<dyn Lease>>,
 }
 
@@ -86,16 +140,28 @@ impl Privileges {
             title: title.to_string(),
             capabilities: capabilities.clone(),
             grant,
+            ca: CaState::NotNeeded,
+            programs: Vec::new(),
             lease: None,
         }
     }
 
-    fn helper(&self) -> Result<Option<&SharedHelper>, String> {
+    pub fn with_programs(mut self, programs: Vec<String>) -> Self {
+        self.programs = programs;
+        self
+    }
+
+    pub fn with_ca(mut self, ca: CaState) -> Self {
+        self.ca = ca;
+        self
+    }
+
+    fn route(&self) -> Result<Route<'_>, String> {
         if self.capabilities.is_empty() {
-            return Ok(None);
+            return Ok(Route::Nothing);
         }
         let Some(helper) = &self.helper else {
-            return Ok(None);
+            return Ok(Route::Skipped);
         };
         if self.grant != Grant::Granted {
             return Err(format!(
@@ -112,11 +178,18 @@ impl Privileges {
                 unsupported.join(", ")
             ));
         }
-        Ok(Some(helper))
+        if let CaState::Missing(reason) = &self.ca {
+            return Err(reason.clone());
+        }
+        if through_helper(&self.capabilities) {
+            Ok(Route::Helper(helper))
+        } else {
+            Ok(Route::Nothing)
+        }
     }
 
     pub fn check(&self) -> Result<(), String> {
-        if let Some(helper) = self.helper()? {
+        if let Route::Helper(helper) = self.route()? {
             helper.lease()?;
         }
         Ok(())
@@ -126,18 +199,25 @@ impl Privileges {
         if self.lease.is_some() {
             return Ok(());
         }
-        let Some(helper) = self.helper()? else {
-            if !self.capabilities.is_empty() {
+        let helper = match self.route()? {
+            Route::Helper(helper) => helper,
+            Route::Skipped => {
                 log::warn!(
                     "{} declares changes to this machine, which The Cabinet cannot make on this system yet; continuing without them",
                     self.title
                 );
+                return Ok(());
             }
-            return Ok(());
+            Route::Nothing => {
+                for item in settled(&self.capabilities) {
+                    log::info!("{}: {item} needs no session change here", self.title);
+                }
+                return Ok(());
+            }
         };
-        let service = service_ip(service)?;
+        let changes = session_changes(&self.capabilities, service, &self.programs)?;
         let mut lease = helper.lease()?;
-        for change in session_changes(&self.capabilities, service) {
+        for change in changes {
             lease.apply(&self.owner, &change)?;
             log::info!("{}: applied {change:?}", self.title);
         }
@@ -381,6 +461,143 @@ pub(crate) mod tests {
 
     #[test]
     fn capabilities_the_helper_cannot_apply_yet_block_the_session() {
+        let capabilities = Capabilities {
+            firewall: Some(cabinet_cartridge::manifest::Firewall {
+                scope: Scope::Install,
+                inbound: vec![cabinet_cartridge::manifest::Port {
+                    proto: cabinet_cartridge::manifest::Proto::Tcp,
+                    port: 55440,
+                }],
+            }),
+            ..hosts()
+        };
+        let helper: SharedHelper = Arc::new(FakeHelper::default());
+        let err = privileges(Some(helper), &capabilities, Grant::Granted)
+            .check()
+            .unwrap_err();
+        assert!(err.contains("firewall"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn low_ports_need_no_helper_on_macos_but_still_need_approval() {
+        let capabilities = Capabilities {
+            low_ports: vec![443],
+            ..Capabilities::default()
+        };
+        let down = || -> Option<SharedHelper> {
+            Some(Arc::new(FakeHelper {
+                down: true,
+                ..FakeHelper::default()
+            }))
+        };
+        let mut granted = privileges(down(), &capabilities, Grant::Granted);
+        granted.check().unwrap();
+        granted.apply("127.0.0.1").unwrap();
+        let err = privileges(down(), &capabilities, Grant::Withheld)
+            .check()
+            .unwrap_err();
+        assert!(err.contains("not approved"), "{err}");
+
+        let helper = Arc::new(FakeHelper::default());
+        let applied = Arc::clone(&helper.applied);
+        let both = Capabilities {
+            low_ports: vec![443],
+            ..hosts()
+        };
+        let mut privileges = privileges(Some(helper), &both, Grant::Granted);
+        privileges.apply("127.0.0.1").unwrap();
+        assert_eq!(applied.lock_or_recover().len(), 1);
+        assert!(matches!(
+            applied.lock_or_recover()[0].1,
+            Change::Hosts { .. }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn trusts_ca(stores: &[CaStore]) -> Capabilities {
+        Capabilities {
+            trust_ca: Some(cabinet_cartridge::manifest::TrustCa {
+                asset: "ca".to_string(),
+                permitted_names: vec!["cabinet-test.invalid".to_string()],
+                scope: Scope::Install,
+                stores: stores.to_vec(),
+                bottle_setting: None,
+            }),
+            ..Capabilities::default()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_session_waits_for_its_certificate_authority_and_the_bottle_store_is_not_built() {
+        let helper = || -> Option<SharedHelper> { Some(Arc::new(FakeHelper::default())) };
+        let system = trusts_ca(&[CaStore::System]);
+        privileges(helper(), &system, Grant::Granted)
+            .with_ca(CaState::Ready)
+            .check()
+            .unwrap();
+        let err = privileges(helper(), &system, Grant::Granted)
+            .with_ca(CaState::Missing("not trusted yet".to_string()))
+            .check()
+            .unwrap_err();
+        assert_eq!(err, "not trusted yet");
+        let err = privileges(
+            helper(),
+            &trusts_ca(&[CaStore::System, CaStore::Bottle]),
+            Grant::Granted,
+        )
+        .check()
+        .unwrap_err();
+        assert!(err.contains("bottle store"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_granted_firewall_allows_the_cartridge_programs_for_the_session() {
+        let capabilities = Capabilities {
+            firewall: Some(cabinet_cartridge::manifest::Firewall {
+                scope: Scope::Session,
+                inbound: vec![cabinet_cartridge::manifest::Port {
+                    proto: cabinet_cartridge::manifest::Proto::Tcp,
+                    port: 55440,
+                }],
+            }),
+            ..Capabilities::default()
+        };
+        let helper = Arc::new(FakeHelper::default());
+        let applied = Arc::clone(&helper.applied);
+        let mut privileges =
+            privileges(Some(helper), &capabilities, Grant::Granted).with_programs(vec![
+                "/store/service".to_string(),
+                "/store/game".to_string(),
+            ]);
+        privileges.apply("").unwrap();
+        let programs: Vec<Change> = applied
+            .lock_or_recover()
+            .iter()
+            .map(|(_, change)| change.clone())
+            .collect();
+        assert_eq!(
+            programs,
+            vec![
+                Change::Firewall {
+                    program: "/store/service".to_string(),
+                    keep: false
+                },
+                Change::Firewall {
+                    program: "/store/game".to_string(),
+                    keep: false
+                },
+            ]
+        );
+        privileges.release();
+        assert!(applied.lock_or_recover().is_empty());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn low_ports_are_not_built_off_macos() {
         let capabilities = Capabilities {
             low_ports: vec![443],
             ..hosts()

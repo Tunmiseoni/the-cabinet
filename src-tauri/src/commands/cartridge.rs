@@ -1,4 +1,5 @@
 use crate::cartridge::assets::HttpFetch;
+use crate::cartridge::catrust;
 use crate::cartridge::install::{self, Installer};
 use crate::cartridge::privileged;
 use crate::cartridge::registry::{CartridgeRef, Entry};
@@ -170,6 +171,7 @@ pub fn cartridge_install(
             log_dir,
             now: crate::time::now_ms(),
             busy,
+            trust: catrust::system().as_deref(),
         }
         .install(&path, settings, &approval.unwrap_or_default())
     })?)
@@ -245,6 +247,7 @@ pub fn cartridge_uninstall(
             platform,
             &log_dir,
             privileged::system().as_deref(),
+            catrust::system().as_deref(),
         )
     })?)
 }
@@ -263,14 +266,16 @@ pub fn cartridge_trust_publisher(
     name: String,
 ) -> CommandResult<()> {
     Ok(with_store(&app, |store| {
-        store.trust_publisher(&publisher, &name, crate::time::now_ms())
+        store.trust_publisher(&publisher, &name, crate::time::now_ms())?;
+        reconcile_cas(store, true)
     })?)
 }
 
 #[tauri::command(async)]
 pub fn cartridge_forget_publisher(app: AppHandle, publisher: String) -> CommandResult<()> {
     Ok(with_store(&app, |store| {
-        store.forget_publisher(&publisher)
+        store.forget_publisher(&publisher)?;
+        reconcile_cas(store, false)
     })?)
 }
 
@@ -282,8 +287,43 @@ pub fn cartridge_approve_capabilities(
 ) -> CommandResult<()> {
     let cartridge = CartridgeRef { publisher, id };
     Ok(with_store(&app, |store| {
-        store.approve_capabilities(&cartridge)
+        store.approve_capabilities(&cartridge)?;
+        reconcile_ca(store, &cartridge)
     })?)
+}
+
+#[tauri::command(async)]
+pub fn cartridge_trust_ca(app: AppHandle, publisher: String, id: String) -> CommandResult<()> {
+    let cartridge = CartridgeRef { publisher, id };
+    Ok(with_store(&app, |store| reconcile_ca(store, &cartridge))?)
+}
+
+fn reconcile_ca(store: &mut Store, cartridge: &CartridgeRef) -> crate::error::Result<()> {
+    match catrust::system() {
+        Some(trust) => catrust::reconcile(store, cartridge, &*trust, true, crate::time::now_ms()),
+        None => Ok(()),
+    }
+}
+
+fn reconcile_cas(store: &mut Store, add: bool) -> crate::error::Result<()> {
+    let Some(trust) = catrust::system() else {
+        return Ok(());
+    };
+    let problems = catrust::reconcile_all(store, &*trust, add, crate::time::now_ms());
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; ").into())
+    }
+}
+
+pub fn reconcile_cas_on_startup(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(err) = with_store(&app, |store| reconcile_cas(store, false)) {
+            log::warn!("cannot tidy trusted certificate authorities: {err}");
+        }
+    });
 }
 
 struct Local {

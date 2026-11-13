@@ -405,7 +405,36 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> R
     Ok(())
 }
 
+fn check_declared_ca(source: &Path, manifest: &Manifest) -> Result<()> {
+    let Some(declared) = &manifest.capabilities.trust_ca else {
+        return Ok(());
+    };
+    let Some(file) = manifest
+        .asset(&declared.asset)
+        .and_then(|asset| asset.file.as_ref())
+    else {
+        return Ok(());
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    let bytes = fs::read(source.join(file))?;
+    crate::ca::check(&bytes, &declared.permitted_names, now)
+        .map(|_| ())
+        .map_err(|reason| invalid(format!("the certificate authority {file}: {reason}")))
+}
+
 pub fn pack(source: &Path, out: &Path, signer: Option<&dyn Signer>) -> Result<Packed> {
+    pack_with(source, out, signer, true)
+}
+
+#[doc(hidden)]
+pub fn pack_with(
+    source: &Path,
+    out: &Path,
+    signer: Option<&dyn Signer>,
+    check_ca: bool,
+) -> Result<Packed> {
     let manifest_path = source.join(MANIFEST_PATH);
     let manifest_text = fs::read_to_string(&manifest_path)
         .map_err(|err| invalid(format!("cannot read {}: {err}", manifest_path.display())))?;
@@ -431,6 +460,9 @@ pub fn pack(source: &Path, out: &Path, signer: Option<&dyn Signer>) -> Result<Pa
     }
     let present: BTreeSet<String> = files.iter().map(|(relative, _)| relative.clone()).collect();
     check_bundled(&manifest, &present)?;
+    if check_ca {
+        check_declared_ca(source, &manifest)?;
+    }
 
     let mut hashed = Vec::new();
     for (relative, path) in &files {

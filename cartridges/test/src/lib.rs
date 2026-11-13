@@ -22,7 +22,11 @@ pub fn run(args: &[String], input: impl BufRead, output: impl Write) -> i32 {
         Some(_) => return 11,
     };
     if has("--service") {
-        return service(lines, &mut out);
+        let bind = args
+            .iter()
+            .position(|arg| arg == "--bind")
+            .and_then(|at| args.get(at + 1));
+        return service(bind, lines, &mut out);
     }
     if has("--fail") {
         out.say(&FromProgram::Error {
@@ -60,7 +64,34 @@ impl<W: Write> Out<W> {
     }
 }
 
-fn service(lines: impl Iterator<Item = String>, out: &mut Out<impl Write>) -> i32 {
+pub fn bind_only(port: u16) -> std::io::Result<socket2::Socket> {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+    let address = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+    socket.bind(&address.into())?;
+    Ok(socket)
+}
+
+fn service(
+    bind: Option<&String>,
+    lines: impl Iterator<Item = String>,
+    out: &mut Out<impl Write>,
+) -> i32 {
+    let _held = bind.and_then(|port| {
+        let bound = port
+            .parse::<u16>()
+            .map_err(|err| err.to_string())
+            .and_then(|port| bind_only(port).map_err(|err| err.to_string()));
+        match bound {
+            Ok(socket) => {
+                out.log(format!("echo-cart bound port {port}"));
+                Some(socket)
+            }
+            Err(err) => {
+                out.log(format!("echo-cart cannot bind port {port}: {err}"));
+                None
+            }
+        }
+    });
     out.say(&FromProgram::Ready {});
     out.log("echo-cart service up".to_string());
     for line in lines {

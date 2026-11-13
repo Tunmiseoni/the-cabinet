@@ -10,6 +10,8 @@ A cartridge that exercises the whole cartridge contract and plays no game. It is
 | `lifecycle.session` | `echo-cart` on every member: publishes `state` with every widget kind and reacts to every event |
 | `lifecycle.uninstall` | runs before the footprint restore |
 | `capabilities.hosts` | a session-scoped hosts entry on `cabinet-test.invalid`, pointed at the service |
+| `capabilities.low_ports` | the service binds port 987 on the wildcard address (on macOS this needs no privileged change) |
+| `capabilities.firewall` | the cartridge's program is allowed through the firewall for the session (on macOS the allowance is per program; the port is informational) |
 | `[[settings]]` | one required `dir` setting, `scratch_dir` |
 
 ## echo-cart
@@ -20,6 +22,7 @@ A cartridge that exercises the whole cartridge contract and plays no game. It is
 |---|---|
 | `echo-cart` | session: `ready`, then `state` after every event; `public` carries `hello` (own id), `role`, `service`, `members`, `seen` (other members' `hello`) and `actions` |
 | `echo-cart --service` | `ready`, then waits for `stop` |
+| `echo-cart --service --bind <port>` | also binds `<port>` on the wildcard address (without listening) until it stops, and logs whether that worked |
 | `echo-cart --fail` | reports a fatal `error` and exits 3 |
 | `echo-cart setup <file>` | writes `<file>` |
 | `echo-cart uninstall` | exits 0 |

@@ -3,6 +3,7 @@ use std::net::Ipv4Addr;
 
 pub const PROVEN_HOSTS: Option<&[&str]> = Some(&["cabinet-test.invalid"]);
 pub const MAX_HOSTS_NAMES: usize = 32;
+pub const MAX_PROGRAM_PATH: usize = 1024;
 const RESERVED: &[&str] = &["localhost", "broadcasthost"];
 
 pub fn is_dns_name(value: &str) -> bool {
@@ -73,6 +74,21 @@ pub fn check(owner: &str, scope: Scope, change: &Change) -> Result<(), String> {
             }
             if !is_room_address(*target) {
                 return Err(format!("{target} is not this machine or a tailnet address"));
+            }
+            Ok(())
+        }
+        Change::Firewall { program, keep } => {
+            if scope != Scope::Session {
+                return Err("firewall allowances are session-scoped".to_string());
+            }
+            if *keep {
+                return Err("only the helper decides what it keeps".to_string());
+            }
+            if !program.starts_with('/')
+                || program.len() > MAX_PROGRAM_PATH
+                || program.chars().any(char::is_control)
+            {
+                return Err("the program is not an absolute path".to_string());
             }
             Ok(())
         }
@@ -159,6 +175,23 @@ mod tests {
         assert!(check(OWNER, Scope::Install, &change).is_err());
         for owner in ["", "test", "a/b/c", "A/test", "a/te st", "a/"] {
             assert!(check(owner, Scope::Session, &change).is_err(), "{owner}");
+        }
+    }
+
+    #[test]
+    fn firewall_requests_name_one_absolute_program_for_a_session() {
+        let firewall = |program: &str, keep: bool| Change::Firewall {
+            program: program.to_string(),
+            keep,
+        };
+        check(OWNER, Scope::Session, &firewall("/a/b", false)).unwrap();
+        assert!(check(OWNER, Scope::Install, &firewall("/a/b", false)).is_err());
+        assert!(check(OWNER, Scope::Session, &firewall("/a/b", true)).is_err());
+        for program in ["", "a/b", "/a\nb", &format!("/{}", "a".repeat(2000))] {
+            assert!(
+                check(OWNER, Scope::Session, &firewall(program, false)).is_err(),
+                "{program}"
+            );
         }
     }
 }

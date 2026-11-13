@@ -44,6 +44,7 @@ fn bench(tag: &str, extra: &str) -> Bench {
         log_dir: scratch.path("logs"),
         now: 1,
         busy: false,
+        trust: None,
     }
     .install(&cart, None, &Approval::default())
     .unwrap();
@@ -395,11 +396,19 @@ fn echo_cart_binary() -> PathBuf {
 }
 
 fn test_cartridge(tag: &str, settings: Map<String, Value>) -> (Bench, Publisher) {
-    let scratch = Scratch::new(tag);
+    test_cartridge_in(Scratch::new(tag), settings)
+}
+
+fn test_cartridge_in(scratch: Scratch, settings: Map<String, Value>) -> (Bench, Publisher) {
     let text = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cartridges/test/cartridge.toml"),
     )
     .unwrap();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let text = text.replace("low_ports = [987]\n", "").replace(
+        "[capabilities.firewall]\nscope   = \"session\"\ninbound = [{ proto = \"tcp\", port = 987 }]\n",
+        "",
+    );
     let manifest = Manifest::parse(&text, None).unwrap();
     let stage = scratch.path("stage");
     std::fs::create_dir_all(&stage).unwrap();
@@ -427,6 +436,7 @@ fn test_cartridge(tag: &str, settings: Map<String, Value>) -> (Bench, Publisher)
         log_dir: scratch.path("logs"),
         now: 1,
         busy: false,
+        trust: None,
     }
     .install(
         &cart,
@@ -447,9 +457,35 @@ fn test_cartridge(tag: &str, settings: Map<String, Value>) -> (Bench, Publisher)
 }
 
 #[cfg(unix)]
+#[derive(Clone, Default)]
+struct FakeFirewall(Arc<Mutex<Vec<String>>>);
+
+#[cfg(unix)]
+impl cabinet_helper::firewall::AppFirewall for FakeFirewall {
+    fn enabled(&self) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    fn listed(&self, program: &str) -> Result<bool, String> {
+        Ok(self.0.lock_or_recover().iter().any(|app| app == program))
+    }
+
+    fn allow(&self, program: &str) -> Result<(), String> {
+        self.0.lock_or_recover().push(program.to_string());
+        Ok(())
+    }
+
+    fn remove(&self, program: &str) -> Result<(), String> {
+        self.0.lock_or_recover().retain(|app| app != program);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 struct FakeSystem {
     socket: PathBuf,
     hosts: PathBuf,
+    firewall: FakeFirewall,
 }
 
 #[cfg(unix)]
@@ -463,6 +499,7 @@ impl FakeSystem {
         let system = Self {
             socket: dir.join("helper.sock"),
             hosts: dir.join("hosts"),
+            firewall: FakeFirewall::default(),
         };
         std::fs::write(&system.hosts, Self::HOSTS).unwrap();
         let server = cabinet_helper::server::Server::bind(cabinet_helper::server::Config {
@@ -471,6 +508,11 @@ impl FakeSystem {
             hosts: system.hosts.clone(),
             uid: None,
             flush: false,
+            programs: Some(cabinet_helper::firewall::Programs {
+                firewall: Box::new(system.firewall.clone()),
+                root: scratch.path("app"),
+                uid: None,
+            }),
         })
         .unwrap();
         std::thread::spawn(move || server.run());
@@ -511,17 +553,36 @@ impl FakeSystem {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "needs The Cabinet's helper installed on this Mac; it edits /etc/hosts"]
+#[ignore = "needs The Cabinet's helper installed on this Mac; it edits /etc/hosts and the firewall's app list"]
 fn the_installed_helper_redirects_the_test_name_for_a_session() {
     let system = FakeSystem {
         socket: cabinet_helper::system::SOCKET.into(),
         hosts: cabinet_helper::system::HOSTS.into(),
+        firewall: FakeFirewall::default(),
     };
     let before = system.hosts();
     assert_eq!(system.redirects(), 0, "{before}");
     let scratch_dir = Scratch::new("rt-live-helper-scratch");
-    let (mut bench, _) = test_cartridge(
-        "rt-live-helper",
+    let firewall_apps = || {
+        let output = std::process::Command::new("/usr/libexec/ApplicationFirewall/socketfilterfw")
+            .arg("--listapps")
+            .output()
+            .unwrap();
+        cabinet_helper::firewall::listed(&String::from_utf8_lossy(&output.stdout))
+    };
+    let apps_before = firewall_apps();
+    let allowed = |apps: &[(String, bool)]| -> Vec<String> {
+        apps.iter()
+            .filter(|(path, allowed)| *allowed && path.ends_with("/echo-cart"))
+            .filter(|(path, _)| path.contains("/live-test-"))
+            .map(|(path, _)| path.clone())
+            .collect()
+    };
+    let app_data = crate::env::home_dir()
+        .unwrap()
+        .join(cabinet_helper::system::APP_DATA);
+    let (mut bench, _) = test_cartridge_in(
+        Scratch::at(app_data.join(format!("live-test-{}", std::process::id()))),
         Map::from_iter([(
             "scratch_dir".to_string(),
             json!(scratch_dir.path("").to_string_lossy()),
@@ -544,10 +605,51 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
         view.room.members.iter().all(|m| m.status == Status::Ready)
     });
     assert_eq!(system.redirects(), 2, "{}", system.hosts());
+    let during = firewall_apps();
+    assert_eq!(allowed(&during).len(), 1, "{during:?}");
+    assert_eq!(during.len(), apps_before.len() + 1);
     block_on(member.stop());
     assert_eq!(system.redirects(), 1, "{}", system.hosts());
+    assert_eq!(allowed(&firewall_apps()).len(), 1);
     block_on(host.stop());
     assert_eq!(system.hosts(), before);
+    assert_eq!(firewall_apps(), apps_before);
+
+    let mut crashed = cabinet_helper::client::Client::connect(&system.socket).unwrap();
+    crashed
+        .apply(
+            &crate::cartridge::privileged::owner(&bench.installed.cartridge),
+            cabinet_helper::protocol::Scope::Session,
+            &cabinet_helper::protocol::Change::Firewall {
+                program: allowed(&during)[0].clone(),
+                keep: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(allowed(&firewall_apps()).len(), 1);
+    drop(crashed);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while firewall_apps() != apps_before {
+        assert!(
+            Instant::now() < deadline,
+            "a crashed caller's allowance stayed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut outsider = cabinet_helper::client::Client::connect(&system.socket).unwrap();
+    for program in ["/bin/sh", "/usr/bin/python3"] {
+        outsider
+            .apply(
+                &crate::cartridge::privileged::owner(&bench.installed.cartridge),
+                cabinet_helper::protocol::Scope::Session,
+                &cabinet_helper::protocol::Change::Firewall {
+                    program: program.to_string(),
+                    keep: false,
+                },
+            )
+            .unwrap_err();
+    }
+    assert_eq!(firewall_apps(), apps_before);
 
     let crashed = system.leave_a_redirect(&bench.installed.cartridge);
     drop(crashed);
@@ -561,6 +663,7 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
         platform(),
         &bench.scratch.path("logs"),
         bench.helper.as_deref(),
+        None,
     )
     .unwrap();
     assert!(problems.is_empty(), "{problems:?}");
@@ -690,6 +793,18 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
     ];
     #[cfg(unix)]
     assert_eq!(system.redirects(), 2, "{}", system.hosts());
+    #[cfg(target_os = "macos")]
+    {
+        let allowed = system.firewall.0.lock_or_recover().clone();
+        assert_eq!(allowed.len(), 1, "{allowed:?}");
+        assert!(allowed[0].ends_with("/echo-cart"), "{allowed:?}");
+    }
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        echo_cart::bind_only(987).err().map(|err| err.kind()),
+        Some(std::io::ErrorKind::AddrInUse),
+        "the service does not hold its low port"
+    );
     block_on(member.stop());
     #[cfg(unix)]
     assert_eq!(system.redirects(), 1, "{}", system.hosts());
@@ -698,6 +813,10 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
     assert_eq!(system.hosts(), FakeSystem::HOSTS);
     assert!(host.view().running.is_empty());
     assert!(member.view().running.is_empty());
+    #[cfg(target_os = "macos")]
+    echo_cart::bind_only(987).expect("the low port is free again after the session");
+    #[cfg(unix)]
+    assert!(system.firewall.0.lock_or_recover().is_empty());
     #[cfg(unix)]
     let _left_behind = system.leave_a_redirect(&bench.installed.cartridge);
     #[cfg(unix)]
@@ -712,6 +831,7 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
         platform(),
         &bench.scratch.path("logs"),
         bench.helper.as_deref(),
+        None,
     )
     .unwrap();
     assert!(problems.is_empty(), "{problems:?}");

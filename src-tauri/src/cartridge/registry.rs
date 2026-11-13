@@ -73,6 +73,8 @@ pub struct Entry {
     pub settings: Map<String, Value>,
     #[serde(default)]
     pub conflicts: Vec<Conflict>,
+    #[serde(default)]
+    pub trusted_ca: Option<super::catrust::TrustedCa>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +97,7 @@ impl Entry {
             approved_capabilities: None,
             settings: Map::new(),
             conflicts: Vec::new(),
+            trusted_ca: None,
         }
     }
 
