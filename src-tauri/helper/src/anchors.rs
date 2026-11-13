@@ -153,7 +153,7 @@ pub(crate) mod tests {
         let scratch = Scratch::new("anchors");
         let anchors = anchors(&scratch);
         let path = anchors.path("7").unwrap();
-        assert!(path.ends_with("/anchors/the-cabinet-7.crt"));
+        assert!(Path::new(&path).ends_with("anchors/the-cabinet-7.crt"));
         anchors.place(&path, "PEM").unwrap();
         assert!(anchors.place(&path, "PEM").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "PEM");
