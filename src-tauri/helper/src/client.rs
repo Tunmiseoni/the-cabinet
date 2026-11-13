@@ -117,6 +117,7 @@ mod tests {
             hosts: scratch.hosts(),
             uid: None,
             flush: false,
+            programs: None,
         })
         .unwrap();
         std::thread::spawn(move || server.run());

@@ -18,6 +18,13 @@ impl Scratch {
         Self(dir)
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn at(dir: PathBuf) -> Self {
+        let _ = archive::remove_tree(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
     pub(crate) fn path(&self, relative: &str) -> PathBuf {
         self.0.join(relative)
     }
@@ -114,7 +121,7 @@ pub(crate) fn build_cart(scratch: &Scratch, spec: &CartSpec<'_>) -> PathBuf {
     }
     let out = scratch.path(&format!("{}-{}.cart", spec.id, spec.version));
     let signer = spec.signer.map(|signer| signer as &dyn Signer);
-    archive::pack(&source, &out, signer).unwrap();
+    archive::pack_with(&source, &out, signer, false).unwrap();
     archive::remove_tree(&source).unwrap();
     out
 }

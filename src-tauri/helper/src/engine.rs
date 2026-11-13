@@ -1,3 +1,4 @@
+use crate::firewall::Programs;
 use crate::hosts;
 use crate::journal::Journal;
 use crate::menu;
@@ -8,6 +9,7 @@ pub struct Engine {
     journal: Journal,
     hosts: PathBuf,
     flush: bool,
+    programs: Option<Programs>,
 }
 
 fn now_ms() -> u64 {
@@ -22,7 +24,32 @@ impl Engine {
             journal: Journal::open(state_dir)?,
             hosts: hosts.to_path_buf(),
             flush,
+            programs: None,
         })
+    }
+
+    pub fn with_programs(mut self, programs: Option<Programs>) -> Self {
+        self.programs = programs;
+        self
+    }
+
+    fn programs(&self) -> Result<&Programs, String> {
+        self.programs
+            .as_ref()
+            .ok_or_else(|| "this helper cannot change the firewall".to_string())
+    }
+
+    fn holds_program(&self, program: &str) -> Option<bool> {
+        self.journal
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.change {
+                Change::Firewall {
+                    program: held,
+                    keep,
+                } if held == program => Some(*keep),
+                _ => None,
+            })
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -43,13 +70,34 @@ impl Engine {
 
     pub fn apply(&mut self, owner: &str, scope: Scope, change: Change) -> Result<Entry, String> {
         menu::check(owner, scope, &change)?;
+        let mut allow = false;
+        let change = match change {
+            Change::Firewall { program, .. } => {
+                let programs = self.programs()?;
+                let program = programs.resolve(&program)?;
+                let keep = match self.holds_program(&program) {
+                    Some(keep) => keep,
+                    None => {
+                        let keep =
+                            !programs.firewall.enabled()? || programs.firewall.listed(&program)?;
+                        allow = !keep;
+                        keep
+                    }
+                };
+                Change::Firewall { program, keep }
+            }
+            other => other,
+        };
         match &change {
             Change::Hosts { names, target } => {
                 for entry in self.journal.entries() {
                     let Change::Hosts {
                         names: held,
                         target: held_target,
-                    } = &entry.change;
+                    } = &entry.change
+                    else {
+                        continue;
+                    };
                     if held_target != target {
                         if let Some(name) = names.iter().find(|name| held.contains(name)) {
                             return Err(format!(
@@ -69,12 +117,17 @@ impl Engine {
                     }
                 }
             }
+            Change::Firewall { .. } => {}
         }
         let entry = self.journal.add(owner, scope, change, now_ms())?;
         let applied = match &entry.change {
             Change::Hosts { names, target } => {
                 self.rewrite_hosts(|text| hosts::add(text, &entry.id, names, *target))
             }
+            Change::Firewall { program, .. } if allow => self
+                .programs()
+                .and_then(|programs| programs.firewall.allow(program)),
+            Change::Firewall { .. } => Ok(()),
         };
         if let Err(err) = applied {
             if let Err(journal) = self.journal.remove(&entry.id) {
@@ -97,6 +150,15 @@ impl Engine {
         };
         match &entry.change {
             Change::Hosts { .. } => self.rewrite_hosts(|text| hosts::remove(text, &entry.id))?,
+            Change::Firewall { program, keep } => {
+                let shared = self.journal.entries().iter().any(|other| {
+                    other.id != entry.id
+                        && matches!(&other.change, Change::Firewall { program: held, .. } if held == program)
+                });
+                if !keep && !shared {
+                    self.programs()?.firewall.remove(program)?;
+                }
+            }
         }
         self.journal.remove(id)?;
         log::info!("undid {} for {}: {:?}", entry.id, entry.owner, entry.change);
@@ -164,6 +226,114 @@ pub(crate) mod tests {
     pub(crate) const BASE: &str = "127.0.0.1\tlocalhost\n# >>> other-tool\n127.0.0.1 api.example-game.net\n# <<< other-tool\n";
 
     pub(crate) struct Scratch(pub PathBuf);
+
+    #[cfg(unix)]
+    pub(crate) fn program(scratch: &Scratch) -> String {
+        let files = scratch.0.join("store").join("cd".repeat(32)).join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let program = files.join("echo-cart");
+        std::fs::write(&program, "x").unwrap();
+        program
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn firewall(program: &str) -> Change {
+        Change::Firewall {
+            program: program.to_string(),
+            keep: false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn with_firewall(scratch: &Scratch, fake: &crate::firewall::tests::FakeFirewall) -> Engine {
+        scratch.engine().with_programs(Some(Programs {
+            firewall: Box::new(fake.clone()),
+            root: scratch.0.clone(),
+            uid: None,
+        }))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_is_allowed_for_its_sessions_and_removed_with_the_last_one() {
+        let scratch = Scratch::new("fw");
+        let fake = crate::firewall::tests::FakeFirewall::default();
+        let program = program(&scratch);
+        let mut engine = with_firewall(&scratch, &fake);
+        let first = engine
+            .apply(OWNER, Scope::Session, firewall(&program))
+            .unwrap();
+        let second = engine
+            .apply(OWNER, Scope::Session, firewall(&program))
+            .unwrap();
+        assert_eq!(*fake.apps.lock().unwrap(), vec![program.clone()]);
+        engine.undo(&first.id).unwrap();
+        assert_eq!(fake.apps.lock().unwrap().len(), 1);
+        engine.undo(&second.id).unwrap();
+        assert!(fake.apps.lock().unwrap().is_empty());
+        assert!(engine.entries().is_empty());
+
+        engine
+            .apply(OWNER, Scope::Session, firewall(&program))
+            .unwrap();
+        let mut restarted = with_firewall(&scratch, &fake);
+        let (undone, failures) = restarted.sweep(|_| false);
+        assert_eq!((undone, failures.len()), (1, 0));
+        assert!(fake.apps.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_allowance_the_cabinet_did_not_add_is_never_removed() {
+        let scratch = Scratch::new("fw-keep");
+        let fake = crate::firewall::tests::FakeFirewall::default();
+        let program = program(&scratch);
+        fake.apps.lock().unwrap().push(program.clone());
+        let mut engine = with_firewall(&scratch, &fake);
+        let entry = engine
+            .apply(OWNER, Scope::Session, firewall(&program))
+            .unwrap();
+        assert_eq!(
+            entry.change,
+            Change::Firewall {
+                program: program.clone(),
+                keep: true
+            }
+        );
+        engine.undo(&entry.id).unwrap();
+        assert_eq!(*fake.apps.lock().unwrap(), vec![program.clone()]);
+
+        fake.apps.lock().unwrap().clear();
+        *fake.off.lock().unwrap() = true;
+        let entry = engine
+            .apply(OWNER, Scope::Session, firewall(&program))
+            .unwrap();
+        assert!(fake.apps.lock().unwrap().is_empty());
+        engine.undo(&entry.id).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn firewall_requests_are_refused_outside_the_store_or_without_a_firewall() {
+        let scratch = Scratch::new("fw-refuse");
+        let fake = crate::firewall::tests::FakeFirewall::default();
+        let program = program(&scratch);
+        let mut plain = scratch.engine();
+        assert!(plain
+            .apply(OWNER, Scope::Session, firewall(&program))
+            .is_err());
+        let mut engine = with_firewall(&scratch, &fake);
+        assert!(engine
+            .apply(OWNER, Scope::Session, firewall("/bin/sh"))
+            .is_err());
+        assert!(engine.entries().is_empty());
+        assert!(fake.apps.lock().unwrap().is_empty());
+    }
 
     impl Scratch {
         pub(crate) fn new(tag: &str) -> Self {

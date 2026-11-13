@@ -1,4 +1,5 @@
 use super::assets::{self, Fetch};
+use super::catrust::{self, TrustStore};
 use super::context::Context;
 use super::footprint;
 use super::privileged::{self, Helper};
@@ -20,6 +21,7 @@ pub struct Installer<'a> {
     pub log_dir: PathBuf,
     pub now: u64,
     pub busy: bool,
+    pub trust: Option<&'a dyn TrustStore>,
 }
 
 pub fn run_step(
@@ -118,6 +120,11 @@ impl Installer<'_> {
         approval: &Approval,
     ) -> crate::error::Result<(Map<String, Value>, Decision)> {
         let manifest = &staged.inspected.manifest;
+        catrust::declared(
+            manifest,
+            &self.store.unpacked(&staged.inspected.digest),
+            self.now,
+        )?;
         let decision = self.store.registry().decide(
             &staged.cartridge,
             &manifest.title,
@@ -175,6 +182,14 @@ impl Installer<'_> {
             }
             Ok(())
         })?;
+        if let Some(trust) = self.trust {
+            if let Err(err) =
+                catrust::reconcile(self.store, &installed.cartridge, trust, true, self.now)
+            {
+                log::warn!("{}: {err}", installed.cartridge);
+                installed.ca_problem = Some(err.to_string());
+            }
+        }
         log::info!(
             "installed {} {} ({}), capabilities {:?}",
             installed.cartridge,
@@ -201,7 +216,13 @@ pub fn uninstall(
     platform: Platform,
     log_dir: &Path,
     helper: Option<&dyn Helper>,
+    trust: Option<&dyn TrustStore>,
 ) -> crate::error::Result<Vec<String>> {
+    if let Some(trust) = trust {
+        catrust::release(store, cartridge, trust).map_err(|err| {
+            format!("{cartridge} stays installed because its certificate authority could not be removed: {err}")
+        })?;
+    }
     let entry = store.entry(cartridge)?.clone();
     let mut problems = Vec::new();
     let mut privileged = entry.approved_capabilities.is_some();

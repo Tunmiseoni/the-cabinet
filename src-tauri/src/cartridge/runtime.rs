@@ -1,4 +1,5 @@
 use super::assets::{self, CheckFailure};
+use super::catrust::{self, CaState};
 use super::context::Context;
 use super::privileged::{Privileges, SharedHelper};
 use super::registry::{self, CartridgeRef};
@@ -37,6 +38,7 @@ pub struct Prepared {
     pub settings: Map<String, Value>,
     pub platform: Platform,
     pub grant: Grant,
+    pub ca: CaState,
 }
 
 impl Prepared {
@@ -60,6 +62,13 @@ impl Prepared {
         }
         let manifest = store.manifest(&digest)?;
         Ok(Self {
+            ca: catrust::state(
+                entry,
+                &manifest,
+                &store.unpacked(&digest),
+                catrust::system().is_some(),
+                crate::time::now_ms(),
+            ),
             cartridge: cartridge.clone(),
             grant: store.registry().grant(entry, &manifest.capabilities),
             manifest,
@@ -107,7 +116,25 @@ impl Prepared {
         }
     }
 
-    fn privileges(&self, helper: Option<SharedHelper>) -> Privileges {
+    fn listeners(&self, host: bool) -> Vec<String> {
+        let mut programs: Vec<String> = Vec::new();
+        let steps: &[StepKind] = if host {
+            &[StepKind::Service, StepKind::Session]
+        } else {
+            &[StepKind::Session]
+        };
+        for step in steps {
+            if let Ok(Some(spec)) = self.context().program(*step) {
+                let program = spec.program.to_string_lossy().into_owned();
+                if !programs.contains(&program) {
+                    programs.push(program);
+                }
+            }
+        }
+        programs
+    }
+
+    fn privileges(&self, helper: Option<SharedHelper>, host: bool) -> Privileges {
         Privileges::new(
             helper,
             &self.cartridge,
@@ -115,6 +142,8 @@ impl Prepared {
             &self.manifest.capabilities,
             self.grant,
         )
+        .with_ca(self.ca.clone())
+        .with_programs(self.listeners(host))
     }
 
     fn room_cartridge(&self) -> RoomCartridge {
@@ -759,7 +788,7 @@ impl Session {
         observer: Observer,
     ) -> crate::error::Result<Session> {
         prepared.preflight()?;
-        let privileges = prepared.privileges(options.helper);
+        let privileges = prepared.privileges(options.helper, true);
         privileges.check()?;
         let room = Room {
             protocol: PROTOCOL,
@@ -847,7 +876,7 @@ impl Session {
         let preview = client.room(None)?;
         let prepared = prepare(&preview.cartridge)?;
         prepared.preflight()?;
-        let privileges = prepared.privileges(options.helper);
+        let privileges = prepared.privileges(options.helper, false);
         privileges.check()?;
         let room = client.join(&JoinRequest {
             member: Joiner {

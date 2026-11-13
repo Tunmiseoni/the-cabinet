@@ -16,6 +16,7 @@ pub struct Config {
     pub hosts: PathBuf,
     pub uid: Option<u32>,
     pub flush: bool,
+    pub programs: Option<crate::firewall::Programs>,
 }
 
 struct State {
@@ -178,7 +179,8 @@ impl Server {
             let _ =
                 std::fs::set_permissions(&config.state_dir, std::fs::Permissions::from_mode(0o700));
         }
-        let mut engine = Engine::open(&config.state_dir, &config.hosts, config.flush)?;
+        let mut engine = Engine::open(&config.state_dir, &config.hosts, config.flush)?
+            .with_programs(config.programs);
         let (undone, failures) = engine.sweep(|_| false);
         if undone > 0 || !failures.is_empty() {
             log::info!("startup sweep: {undone} undone, {} failed", failures.len());

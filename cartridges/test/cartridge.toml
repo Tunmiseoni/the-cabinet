@@ -24,16 +24,23 @@ program = "echo"
 
 [lifecycle.service]
 program = "echo"
-args    = ["--service"]
+args    = ["--service", "--bind", "987"]
 
 [lifecycle.uninstall]
 program = "echo"
 args    = ["uninstall"]
 
+[capabilities]
+low_ports = [987]
+
 [capabilities.hosts]
 names  = ["cabinet-test.invalid"]
 target = "service"
 scope  = "session"
+
+[capabilities.firewall]
+scope   = "session"
+inbound = [{ proto = "tcp", port = 987 }]
 
 [[touches]]
 path = "${setting:scratch_dir}/touch-test.txt"

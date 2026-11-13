@@ -1,7 +1,9 @@
 use crate::engine::Engine;
+use crate::firewall::{Programs, SocketFilter};
 use crate::protocol::LABEL;
 use crate::server::{Config, Server};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
@@ -13,6 +15,7 @@ pub const TOOLS_DIR: &str = "/Library/PrivilegedHelperTools";
 pub const INSTALLED: &str = "/Library/PrivilegedHelperTools/com.the-cabinet.helper";
 pub const PLIST: &str = "/Library/LaunchDaemons/com.the-cabinet.helper.plist";
 pub const LOG: &str = "/Library/Logs/com.the-cabinet.helper.log";
+pub const APP_DATA: &str = "Library/Application Support/com.the-cabinet.app";
 const LAUNCHCTL: &str = "/bin/launchctl";
 
 pub fn plist(uid: u32) -> String {
@@ -42,6 +45,52 @@ pub fn plist(uid: u32) -> String {
 </plist>
 "#
     )
+}
+
+fn home(uid: u32) -> Option<std::path::PathBuf> {
+    let mut record: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0 as libc::c_char; 4096];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut record,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() || record.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr(record.pw_dir) };
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        dir.to_bytes(),
+    )))
+}
+
+pub fn programs(uid: u32) -> Option<Programs> {
+    let Some(home) = home(uid) else {
+        log::warn!("uid {uid} has no home folder; firewall changes are off");
+        return None;
+    };
+    Some(Programs {
+        firewall: Box::new(SocketFilter),
+        root: home.join(APP_DATA),
+        uid: Some(uid),
+    })
+}
+
+fn installed_uid() -> Option<u32> {
+    let plist = std::fs::read_to_string(PLIST).ok()?;
+    let after = plist.split("<string>--uid</string>").nth(1)?;
+    after
+        .split("<string>")
+        .nth(1)?
+        .split("</string>")
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn require_root() -> Result<(), String> {
@@ -101,6 +150,7 @@ pub fn daemon(uid: u32) -> Result<(), String> {
         hosts: HOSTS.into(),
         uid: Some(uid),
         flush: true,
+        programs: programs(uid),
     })?;
     log::info!("listening on {SOCKET} for uid {uid}");
     server.run();
@@ -132,10 +182,13 @@ pub fn install(uid: u32) -> Result<(), String> {
 
 pub fn uninstall() -> Result<(), String> {
     require_root()?;
+    let uid = installed_uid();
     let _ = launchctl(&["bootout", &service()]);
     let mut problems = Vec::new();
     if Path::new(STATE_DIR).exists() {
-        match Engine::open(Path::new(STATE_DIR), Path::new(HOSTS), true) {
+        match Engine::open(Path::new(STATE_DIR), Path::new(HOSTS), true)
+            .map(|engine| engine.with_programs(uid.and_then(programs)))
+        {
             Ok(mut engine) => {
                 let (_, failures) = engine.undo_where(|_| true);
                 problems.extend(failures);
@@ -179,6 +232,13 @@ mod tests {
     fn the_plist_starts_the_installed_helper_for_one_user() {
         let plist = plist(501);
         assert!(plist.contains("<string>com.the-cabinet.helper</string>"));
+        let after = plist.split("<string>--uid</string>").nth(1).unwrap();
+        assert!(after.trim_start().starts_with("<string>501</string>"));
+        let me = unsafe { libc::getuid() };
+        assert_eq!(
+            home(me).unwrap(),
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+        );
         assert!(plist.contains(
             "<string>/Library/PrivilegedHelperTools/com.the-cabinet.helper</string>\n\t\t<string>daemon</string>\n\t\t<string>--uid</string>\n\t\t<string>501</string>"
         ));

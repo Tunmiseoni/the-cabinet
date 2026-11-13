@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const LABEL: &str = "com.the-cabinet.helper";
 pub const MAX_LINE: usize = 64 * 1024;
 
@@ -18,6 +18,11 @@ pub enum Change {
     Hosts {
         names: Vec<String>,
         target: Ipv4Addr,
+    },
+    Firewall {
+        program: String,
+        #[serde(default)]
+        keep: bool,
     },
 }
 

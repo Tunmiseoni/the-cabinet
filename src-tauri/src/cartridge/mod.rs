@@ -1,4 +1,5 @@
 pub(crate) mod assets;
+pub(crate) mod catrust;
 pub(crate) mod context;
 #[cfg(test)]
 pub(crate) mod echo;

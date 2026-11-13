@@ -28,6 +28,7 @@ pub struct Installed {
     pub digest: String,
     pub new: bool,
     pub capabilities: Grant,
+    pub ca_problem: Option<String>,
 }
 
 pub struct Store {
@@ -181,6 +182,7 @@ impl Store {
             digest: digest.clone(),
             new,
             capabilities: Grant::None,
+            ca_problem: None,
         })
     }
 
