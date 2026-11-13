@@ -29,6 +29,8 @@ pub enum Change {
     },
     LowPorts {
         program: String,
+        #[serde(default)]
+        keep: bool,
     },
     TrustCa {
         certificate: String,

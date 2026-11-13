@@ -3,6 +3,7 @@ pub mod engine;
 pub mod firewall;
 pub mod hosts;
 pub mod journal;
+pub mod lowports;
 pub mod menu;
 pub mod protocol;
 pub mod server;

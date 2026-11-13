@@ -8,7 +8,8 @@ pub trait AppFirewall: Send {
 }
 
 pub struct Programs {
-    pub firewall: Box<dyn AppFirewall>,
+    pub firewall: Option<Box<dyn AppFirewall>>,
+    pub low_ports: Option<Box<dyn crate::lowports::PortGrant>>,
     pub root: PathBuf,
     pub uid: Option<u32>,
 }
@@ -208,7 +209,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(scratch.0.join("store/short/files")).unwrap();
         std::fs::write(scratch.0.join("store/short/files/x"), "x").unwrap();
         let programs = Programs {
-            firewall: Box::new(FakeFirewall::default()),
+            firewall: Some(Box::new(FakeFirewall::default())),
+            low_ports: None,
             root: scratch.0.clone(),
             uid: None,
         };
@@ -231,7 +233,8 @@ pub(crate) mod tests {
                 .resolve(files.join("link").to_str().unwrap())
                 .is_err());
             let other = Programs {
-                firewall: Box::new(FakeFirewall::default()),
+                firewall: Some(Box::new(FakeFirewall::default())),
+                low_ports: None,
                 root: scratch.0.clone(),
                 uid: Some(u32::MAX - 7),
             };

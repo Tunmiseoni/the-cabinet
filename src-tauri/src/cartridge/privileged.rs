@@ -43,8 +43,15 @@ pub fn session_changes(
     capabilities: &Capabilities,
     service: &str,
     programs: &[String],
+    service_program: Option<&str>,
 ) -> Result<Vec<Change>, String> {
     let mut changes = Vec::new();
+    if let Some(program) = service_program.filter(|_| low_ports_through_helper(capabilities)) {
+        changes.push(Change::LowPorts {
+            program: program.to_string(),
+            keep: false,
+        });
+    }
     if let Some(hosts) = &capabilities.hosts {
         changes.push(Change::Hosts {
             names: hosts.names.clone(),
@@ -59,6 +66,10 @@ pub fn session_changes(
         }));
     }
     Ok(changes)
+}
+
+fn low_ports_through_helper(capabilities: &Capabilities) -> bool {
+    cfg!(target_os = "linux") && !capabilities.low_ports.is_empty()
 }
 
 fn settled(capabilities: &Capabilities) -> Vec<&'static str> {
@@ -88,7 +99,10 @@ fn settled(capabilities: &Capabilities) -> Vec<&'static str> {
 fn unsupported(capabilities: &Capabilities) -> Vec<&'static str> {
     let mut items = Vec::new();
     let settled = settled(capabilities);
-    if !capabilities.low_ports.is_empty() && !settled.contains(&"low_ports") {
+    if !capabilities.low_ports.is_empty()
+        && !settled.contains(&"low_ports")
+        && !low_ports_through_helper(capabilities)
+    {
         items.push("low_ports");
     }
     if let Some(ca) = &capabilities.trust_ca {
@@ -106,10 +120,6 @@ fn unsupported(capabilities: &Capabilities) -> Vec<&'static str> {
     items
 }
 
-fn through_helper(capabilities: &Capabilities) -> bool {
-    capabilities.hosts.is_some() || capabilities.firewall.is_some()
-}
-
 enum Route<'a> {
     Nothing,
     Skipped,
@@ -124,6 +134,7 @@ pub struct Privileges {
     grant: Grant,
     ca: CaState,
     programs: Vec<String>,
+    service_program: Option<String>,
     lease: Option<Box<dyn Lease>>,
 }
 
@@ -143,6 +154,7 @@ impl Privileges {
             grant,
             ca: CaState::NotNeeded,
             programs: Vec::new(),
+            service_program: None,
             lease: None,
         }
     }
@@ -150,6 +162,17 @@ impl Privileges {
     pub fn with_programs(mut self, programs: Vec<String>) -> Self {
         self.programs = programs;
         self
+    }
+
+    pub fn with_service_program(mut self, program: Option<String>) -> Self {
+        self.service_program = program;
+        self
+    }
+
+    fn through_helper(&self) -> bool {
+        self.capabilities.hosts.is_some()
+            || self.capabilities.firewall.is_some()
+            || (self.service_program.is_some() && low_ports_through_helper(&self.capabilities))
     }
 
     pub fn with_ca(mut self, ca: CaState) -> Self {
@@ -182,7 +205,7 @@ impl Privileges {
         if let CaState::Missing(reason) = &self.ca {
             return Err(reason.clone());
         }
-        if through_helper(&self.capabilities) {
+        if self.through_helper() {
             Ok(Route::Helper(helper))
         } else {
             Ok(Route::Nothing)
@@ -216,7 +239,12 @@ impl Privileges {
                 return Ok(());
             }
         };
-        let changes = session_changes(&self.capabilities, service, &self.programs)?;
+        let changes = session_changes(
+            &self.capabilities,
+            service,
+            &self.programs,
+            self.service_program.as_deref(),
+        )?;
         let mut lease = helper.lease()?;
         for change in changes {
             lease.apply(&self.owner, &change)?;
@@ -596,7 +624,42 @@ pub(crate) mod tests {
         assert!(applied.lock_or_recover().is_empty());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn low_ports_go_to_the_helper_for_the_hosts_service_program_on_linux() {
+        let capabilities = Capabilities {
+            low_ports: vec![443],
+            ..Capabilities::default()
+        };
+        let helper = Arc::new(FakeHelper::default());
+        let applied = Arc::clone(&helper.applied);
+        let mut member = privileges(Some(helper.clone()), &capabilities, Grant::Granted);
+        member.apply("127.0.0.1").unwrap();
+        assert!(applied.lock_or_recover().is_empty());
+        let mut host = privileges(Some(helper), &capabilities, Grant::Granted)
+            .with_programs(vec![
+                "/store/service".to_string(),
+                "/store/game".to_string(),
+            ])
+            .with_service_program(Some("/store/service".to_string()));
+        host.apply("127.0.0.1").unwrap();
+        let changes: Vec<Change> = applied
+            .lock_or_recover()
+            .iter()
+            .map(|(_, change)| change.clone())
+            .collect();
+        assert_eq!(
+            changes,
+            vec![Change::LowPorts {
+                program: "/store/service".to_string(),
+                keep: false
+            }]
+        );
+        host.release();
+        assert!(applied.lock_or_recover().is_empty());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn low_ports_are_not_built_off_macos() {
         let capabilities = Capabilities {

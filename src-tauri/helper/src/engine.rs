@@ -1,6 +1,7 @@
-use crate::firewall::Programs;
+use crate::firewall::{AppFirewall, Programs};
 use crate::hosts;
 use crate::journal::Journal;
+use crate::lowports::PortGrant;
 use crate::menu;
 use crate::protocol::{Change, Entry, Scope};
 use std::path::{Path, PathBuf};
@@ -33,24 +34,32 @@ impl Engine {
         self
     }
 
-    fn programs(&self) -> Result<&Programs, String> {
-        self.programs
-            .as_ref()
-            .ok_or_else(|| "this helper cannot change the firewall".to_string())
+    fn firewall(&self) -> Result<(&Programs, &dyn AppFirewall), String> {
+        let refused = || "this helper cannot change the firewall".to_string();
+        let programs = self.programs.as_ref().ok_or_else(refused)?;
+        let firewall = programs.firewall.as_deref().ok_or_else(refused)?;
+        Ok((programs, firewall))
     }
 
-    fn holds_program(&self, program: &str) -> Option<bool> {
+    fn low_ports(&self) -> Result<(&Programs, &dyn PortGrant), String> {
+        let refused = || "this helper cannot grant low ports on this system".to_string();
+        let programs = self.programs.as_ref().ok_or_else(refused)?;
+        let grant = programs.low_ports.as_deref().ok_or_else(refused)?;
+        Ok((programs, grant))
+    }
+
+    fn held(&self, kept: impl Fn(&Change) -> Option<bool>) -> Option<bool> {
         self.journal
             .entries()
             .iter()
-            .find_map(|entry| match &entry.change {
-                Change::Firewall {
-                    program: held,
-                    keep,
-                    ..
-                } if held == program => Some(*keep),
-                _ => None,
-            })
+            .find_map(|entry| kept(&entry.change))
+    }
+
+    fn shared(&self, id: &str, same: impl Fn(&Change) -> bool) -> bool {
+        self.journal
+            .entries()
+            .iter()
+            .any(|other| other.id != id && same(&other.change))
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -71,17 +80,24 @@ impl Engine {
 
     pub fn apply(&mut self, owner: &str, scope: Scope, change: Change) -> Result<Entry, String> {
         menu::check(owner, scope, &change)?;
-        let mut allow = false;
+        let mut act = false;
         let change = match change {
             Change::Firewall { program, ports, .. } => {
-                let programs = self.programs()?;
+                let (programs, firewall) = self.firewall()?;
                 let program = programs.resolve(&program)?;
-                let keep = match self.holds_program(&program) {
+                let held = self.held(|change| match change {
+                    Change::Firewall {
+                        program: held,
+                        keep,
+                        ..
+                    } if *held == program => Some(*keep),
+                    _ => None,
+                });
+                let keep = match held {
                     Some(keep) => keep,
                     None => {
-                        let keep =
-                            !programs.firewall.enabled()? || programs.firewall.listed(&program)?;
-                        allow = !keep;
+                        let keep = !firewall.enabled()? || firewall.listed(&program)?;
+                        act = !keep;
                         keep
                     }
                 };
@@ -91,8 +107,25 @@ impl Engine {
                     keep,
                 }
             }
-            Change::LowPorts { .. } => {
-                return Err("this helper cannot grant low ports on this system".to_string())
+            Change::LowPorts { program, .. } => {
+                let (programs, grant) = self.low_ports()?;
+                let program = programs.resolve(&program)?;
+                let held = self.held(|change| match change {
+                    Change::LowPorts {
+                        program: held,
+                        keep,
+                    } if *held == program => Some(*keep),
+                    _ => None,
+                });
+                let keep = match held {
+                    Some(keep) => keep,
+                    None => {
+                        let keep = grant.granted(&program)?;
+                        act = !keep;
+                        keep
+                    }
+                };
+                Change::LowPorts { program, keep }
             }
             Change::TrustCa {
                 certificate, names, ..
@@ -140,9 +173,12 @@ impl Engine {
             Change::Hosts { names, target } => {
                 self.rewrite_hosts(|text| hosts::add(text, &entry.id, names, *target))
             }
-            Change::Firewall { program, .. } if allow => self
-                .programs()
-                .and_then(|programs| programs.firewall.allow(program)),
+            Change::Firewall { program, .. } if act => self
+                .firewall()
+                .and_then(|(_, firewall)| firewall.allow(program)),
+            Change::LowPorts { program, .. } if act => {
+                self.low_ports().and_then(|(_, grant)| grant.grant(program))
+            }
             Change::Firewall { .. } | Change::LowPorts { .. } | Change::TrustCa { .. } => Ok(()),
         };
         if let Err(err) = applied {
@@ -167,15 +203,22 @@ impl Engine {
         match &entry.change {
             Change::Hosts { .. } => self.rewrite_hosts(|text| hosts::remove(text, &entry.id))?,
             Change::Firewall { program, keep, .. } => {
-                let shared = self.journal.entries().iter().any(|other| {
-                    other.id != entry.id
-                        && matches!(&other.change, Change::Firewall { program: held, .. } if held == program)
+                let shared = self.shared(&entry.id, |other| {
+                    matches!(other, Change::Firewall { program: held, .. } if held == program)
                 });
                 if !keep && !shared {
-                    self.programs()?.firewall.remove(program)?;
+                    self.firewall()?.1.remove(program)?;
                 }
             }
-            Change::LowPorts { .. } | Change::TrustCa { .. } => {
+            Change::LowPorts { program, keep } => {
+                let shared = self.shared(&entry.id, |other| {
+                    matches!(other, Change::LowPorts { program: held, .. } if held == program)
+                });
+                if !keep && !shared {
+                    self.low_ports()?.1.revoke(program)?;
+                }
+            }
+            Change::TrustCa { .. } => {
                 return Err("this helper cannot undo that change on this system".to_string())
             }
         }
@@ -272,7 +315,8 @@ pub(crate) mod tests {
     #[cfg(unix)]
     fn with_firewall(scratch: &Scratch, fake: &crate::firewall::tests::FakeFirewall) -> Engine {
         scratch.engine().with_programs(Some(Programs {
-            firewall: Box::new(fake.clone()),
+            firewall: Some(Box::new(fake.clone())),
+            low_ports: None,
             root: scratch.0.clone(),
             uid: None,
         }))
@@ -336,6 +380,58 @@ pub(crate) mod tests {
             .unwrap();
         assert!(fake.apps.lock().unwrap().is_empty());
         engine.undo(&entry.id).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn low_ports_are_granted_for_their_sessions_and_kept_when_already_there() {
+        let scratch = Scratch::new("low");
+        let grant = crate::lowports::tests::FakeGrant::default();
+        let program = program(&scratch);
+        let mut engine = scratch.engine().with_programs(Some(Programs {
+            firewall: None,
+            low_ports: Some(Box::new(grant.clone())),
+            root: scratch.0.clone(),
+            uid: None,
+        }));
+        let low = |program: &str| Change::LowPorts {
+            program: program.to_string(),
+            keep: false,
+        };
+        let first = engine.apply(OWNER, Scope::Session, low(&program)).unwrap();
+        let second = engine.apply(OWNER, Scope::Session, low(&program)).unwrap();
+        assert_eq!(*grant.programs.lock().unwrap(), vec![program.clone()]);
+        engine.undo(&first.id).unwrap();
+        assert_eq!(grant.programs.lock().unwrap().len(), 1);
+        engine.undo(&second.id).unwrap();
+        assert!(grant.programs.lock().unwrap().is_empty());
+
+        engine.apply(OWNER, Scope::Session, low(&program)).unwrap();
+        let mut engine = scratch.engine().with_programs(Some(Programs {
+            firewall: None,
+            low_ports: Some(Box::new(grant.clone())),
+            root: scratch.0.clone(),
+            uid: None,
+        }));
+        let (undone, failures) = engine.sweep(|_| false);
+        assert_eq!((undone, failures.len()), (1, 0));
+        assert!(grant.programs.lock().unwrap().is_empty());
+
+        grant.programs.lock().unwrap().push(program.clone());
+        let kept = engine.apply(OWNER, Scope::Session, low(&program)).unwrap();
+        assert_eq!(
+            kept.change,
+            Change::LowPorts {
+                program: program.clone(),
+                keep: true
+            }
+        );
+        engine.undo(&kept.id).unwrap();
+        assert_eq!(*grant.programs.lock().unwrap(), vec![program.clone()]);
+
+        assert!(engine.apply(OWNER, Scope::Session, low("/bin/sh")).is_err());
+        let mut plain = scratch.engine();
+        assert!(plain.apply(OWNER, Scope::Session, low(&program)).is_err());
     }
 
     #[cfg(unix)]

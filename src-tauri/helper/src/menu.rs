@@ -107,9 +107,12 @@ pub fn check(owner: &str, scope: Scope, change: &Change) -> Result<(), String> {
             }
             Ok(())
         }
-        Change::LowPorts { program } => {
+        Change::LowPorts { program, keep } => {
             if scope != Scope::Session {
                 return Err("low ports are session-scoped".to_string());
+            }
+            if *keep {
+                return Err("only the helper decides what it keeps".to_string());
             }
             check_program(program)
         }
@@ -313,10 +316,16 @@ mod tests {
     fn low_ports_name_one_absolute_program_for_a_session() {
         let low = |program: &str| Change::LowPorts {
             program: program.to_string(),
+            keep: false,
         };
         check(OWNER, Scope::Session, &low("/a/b")).unwrap();
         assert!(check(OWNER, Scope::Install, &low("/a/b")).is_err());
         assert!(check(OWNER, Scope::Session, &low("a/b")).is_err());
+        let kept = Change::LowPorts {
+            program: "/a/b".to_string(),
+            keep: true,
+        };
+        assert!(check(OWNER, Scope::Session, &kept).is_err());
     }
 
     const GOOD: &str = include_str!("../../cartridge/src/fixtures/ca-good.pem");

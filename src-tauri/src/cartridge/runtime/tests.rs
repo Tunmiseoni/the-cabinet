@@ -404,7 +404,7 @@ fn test_cartridge_in(scratch: Scratch, settings: Map<String, Value>) -> (Bench, 
     )
     .unwrap();
     #[cfg(not(any(target_os = "macos", windows)))]
-    let text = text.replace("low_ports = [987]\n", "").replace(
+    let text = text.replace(
         "[capabilities.firewall]\nscope   = \"session\"\ninbound = [{ proto = \"tcp\", port = 987 }]\n",
         "",
     );
@@ -481,10 +481,32 @@ impl cabinet_helper::firewall::AppFirewall for FakeFirewall {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Default)]
+struct FakeGrant(Arc<Mutex<Vec<String>>>);
+
+#[cfg(unix)]
+impl cabinet_helper::lowports::PortGrant for FakeGrant {
+    fn granted(&self, program: &str) -> Result<bool, String> {
+        Ok(self.0.lock_or_recover().iter().any(|held| held == program))
+    }
+
+    fn grant(&self, program: &str) -> Result<(), String> {
+        self.0.lock_or_recover().push(program.to_string());
+        Ok(())
+    }
+
+    fn revoke(&self, program: &str) -> Result<(), String> {
+        self.0.lock_or_recover().retain(|held| held != program);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 struct FakeSystem {
     socket: PathBuf,
     hosts: PathBuf,
     firewall: FakeFirewall,
+    low_ports: FakeGrant,
 }
 
 #[cfg(unix)]
@@ -499,6 +521,7 @@ impl FakeSystem {
             socket: dir.join("helper.sock"),
             hosts: dir.join("hosts"),
             firewall: FakeFirewall::default(),
+            low_ports: FakeGrant::default(),
         };
         std::fs::write(&system.hosts, Self::HOSTS).unwrap();
         let server = cabinet_helper::server::Server::bind(cabinet_helper::server::Config {
@@ -508,7 +531,8 @@ impl FakeSystem {
             user: None,
             flush: false,
             programs: Some(cabinet_helper::firewall::Programs {
-                firewall: Box::new(system.firewall.clone()),
+                firewall: Some(Box::new(system.firewall.clone())),
+                low_ports: Some(Box::new(system.low_ports.clone())),
                 root: scratch.path("app"),
                 uid: None,
             }),
@@ -558,6 +582,7 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
         socket: cabinet_helper::system::SOCKET.into(),
         hosts: cabinet_helper::system::HOSTS.into(),
         firewall: FakeFirewall::default(),
+        low_ports: FakeGrant::default(),
     };
     let before = system.hosts();
     assert_eq!(system.redirects(), 0, "{before}");
@@ -680,6 +705,7 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
         socket: cabinet_helper::system::SOCKET.into(),
         hosts: cabinet_helper::system::HOSTS.into(),
         firewall: FakeFirewall::default(),
+        low_ports: FakeGrant::default(),
     };
     let before = system.hosts();
     assert_eq!(system.redirects(), 0, "{before}");
@@ -692,6 +718,12 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
     assert!(
         !resolves_to_loopback(),
         "the test name resolves before the session"
+    );
+    let low_port = || echo_cart::bind_only(987).err().map(|err| err.kind());
+    assert_eq!(
+        low_port(),
+        Some(std::io::ErrorKind::PermissionDenied),
+        "this user may already bind low ports, so the test proves nothing"
     );
     let scratch_dir = Scratch::new("rt-live-helper-scratch");
     let app_data = crate::env::home_dir()
@@ -725,6 +757,11 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
         resolves_to_loopback(),
         "the test name does not resolve during the session"
     );
+    assert_eq!(
+        low_port(),
+        Some(std::io::ErrorKind::AddrInUse),
+        "the service does not hold its low port"
+    );
     block_on(member.stop());
     assert_eq!(system.redirects(), 1, "{}", system.hosts());
     block_on(host.stop());
@@ -733,6 +770,16 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
         !resolves_to_loopback(),
         "the test name still resolves after the session"
     );
+    assert_eq!(
+        low_port(),
+        Some(std::io::ErrorKind::PermissionDenied),
+        "the service program kept its low-port right after the session"
+    );
+    assert!(cabinet_helper::client::Client::connect(&system.socket)
+        .unwrap()
+        .status()
+        .unwrap()
+        .is_empty());
 
     let mut outsider = cabinet_helper::client::Client::connect(&system.socket).unwrap();
     outsider
@@ -895,6 +942,12 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
         assert_eq!(allowed.len(), 1, "{allowed:?}");
         assert!(allowed[0].ends_with("/echo-cart"), "{allowed:?}");
     }
+    #[cfg(target_os = "linux")]
+    {
+        let granted = system.low_ports.0.lock_or_recover().clone();
+        assert_eq!(granted.len(), 1, "{granted:?}");
+        assert!(granted[0].ends_with("/echo-cart"), "{granted:?}");
+    }
     #[cfg(target_os = "macos")]
     assert_eq!(
         echo_cart::bind_only(987).err().map(|err| err.kind()),
@@ -913,6 +966,8 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
     echo_cart::bind_only(987).expect("the low port is free again after the session");
     #[cfg(unix)]
     assert!(system.firewall.0.lock_or_recover().is_empty());
+    #[cfg(unix)]
+    assert!(system.low_ports.0.lock_or_recover().is_empty());
     #[cfg(unix)]
     let _left_behind = system.leave_a_redirect(&bench.installed.cartridge);
     #[cfg(unix)]

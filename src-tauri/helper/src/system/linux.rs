@@ -39,10 +39,16 @@ fn service() -> String {
 }
 
 pub fn programs(uid: u32) -> Option<Programs> {
-    if home(uid).is_none() {
+    let Some(home) = home(uid) else {
         log::warn!("uid {uid} has no home folder; program changes are off");
-    }
-    None
+        return None;
+    };
+    Some(Programs {
+        firewall: None,
+        low_ports: Some(Box::new(crate::lowports::FileCapability)),
+        root: home.join(APP_DATA),
+        uid: Some(uid),
+    })
 }
 
 fn installed_uid() -> Option<u32> {
