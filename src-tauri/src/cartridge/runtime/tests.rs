@@ -381,18 +381,17 @@ fn a_member_without_the_rooms_build_is_told_to_install_it() {
 
 fn echo_cart_binary() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
-    let binary = exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(format!("echo-cart{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        binary.is_file(),
-        "{} is missing: build it with `cargo build -p echo-cart` (`cargo test --workspace` does)",
-        binary.display()
-    );
-    binary
+    let name = format!("echo-cart{}", std::env::consts::EXE_SUFFIX);
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join(&name))
+        .find(|binary| binary.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "{name} is missing above {}: build it with `cargo build -p echo-cart` (`cargo test --workspace` does)",
+                exe.display()
+            )
+        })
 }
 
 fn test_cartridge(tag: &str, settings: Map<String, Value>) -> (Bench, Publisher) {
