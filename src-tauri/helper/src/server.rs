@@ -1,3 +1,5 @@
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use crate::engine::Engine;
 use crate::protocol::{self, Request, Response, Scope, MAX_LINE, VERSION};
 use std::collections::BTreeSet;
