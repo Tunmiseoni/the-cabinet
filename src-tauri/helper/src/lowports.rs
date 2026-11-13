@@ -122,6 +122,7 @@ impl PortGrant for FileCapability {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};

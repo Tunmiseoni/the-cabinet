@@ -757,10 +757,60 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
         resolves_to_loopback(),
         "the test name does not resolve during the session"
     );
+    let low_port_evidence = || {
+        let entries = cabinet_helper::client::Client::connect(&system.socket)
+            .and_then(|mut client| client.status())
+            .unwrap_or_default();
+        let mut lines = vec![format!("journal: {entries:?}")];
+        for entry in &entries {
+            let cabinet_helper::protocol::Change::LowPorts { program, .. } = &entry.change else {
+                continue;
+            };
+            let attribute = std::process::Command::new("getfattr")
+                .args(["-d", "-m", "security.capability", "-e", "hex", program])
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_else(|err| err.to_string());
+            lines.push(format!("{program}: {attribute}"));
+            let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            lines.push(format!(
+                "mounts: {:?}",
+                mounts
+                    .lines()
+                    .filter(|line| line.contains(" / ") || line.contains("/home"))
+                    .collect::<Vec<_>>()
+            ));
+            for dir in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+                let exe = std::fs::read_link(dir.path().join("exe")).ok();
+                if exe.as_deref() == Some(std::path::Path::new(program)) {
+                    let status =
+                        std::fs::read_to_string(dir.path().join("status")).unwrap_or_default();
+                    lines.push(format!(
+                            "pid {:?}: {:?}",
+                            dir.file_name(),
+                            status
+                                .lines()
+                                .filter(|line| line.starts_with("Cap")
+                                    || line.starts_with("NoNewPrivs"))
+                                .collect::<Vec<_>>()
+                        ));
+                }
+            }
+        }
+        let own = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        lines.push(format!(
+            "test process: {:?}",
+            own.lines()
+                .filter(|line| line.starts_with("CapBnd") || line.starts_with("NoNewPrivs"))
+                .collect::<Vec<_>>()
+        ));
+        lines.join("\n")
+    };
     assert_eq!(
         low_port(),
         Some(std::io::ErrorKind::AddrInUse),
-        "the service does not hold its low port"
+        "the service does not hold its low port\n{}",
+        low_port_evidence()
     );
     block_on(member.stop());
     assert_eq!(system.redirects(), 1, "{}", system.hosts());
