@@ -253,7 +253,8 @@ mod tests {
         let text = super::pem(&ca.der);
         assert_eq!(
             text.replace('\n', ""),
-            String::from_utf8_lossy(include_bytes!("fixtures/ca-good.pem")).replace('\n', "")
+            String::from_utf8_lossy(include_bytes!("fixtures/ca-good.pem"))
+                .replace(['\r', '\n'], "")
         );
         assert_eq!(check(text.as_bytes(), &names(&[NAME]), NOW).unwrap(), ca);
         assert!(text.lines().all(|line| line.len() <= 64));
