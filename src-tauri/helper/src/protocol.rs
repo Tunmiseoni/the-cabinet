@@ -26,6 +26,8 @@ pub enum Change {
         ports: Vec<Port>,
         #[serde(default)]
         keep: bool,
+        #[serde(default)]
+        opened: Vec<Port>,
     },
     LowPorts {
         program: String,

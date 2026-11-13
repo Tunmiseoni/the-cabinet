@@ -84,11 +84,12 @@ pub fn check(owner: &str, scope: Scope, change: &Change) -> Result<(), String> {
             program,
             ports,
             keep,
+            opened,
         } => {
             if scope != Scope::Session {
                 return Err("firewall allowances are session-scoped".to_string());
             }
-            if *keep {
+            if *keep || !opened.is_empty() {
                 return Err("only the helper decides what it keeps".to_string());
             }
             check_program(program)?;
@@ -268,10 +269,21 @@ mod tests {
             program: program.to_string(),
             ports: Vec::new(),
             keep,
+            opened: Vec::new(),
         };
         check(OWNER, Scope::Session, &firewall("/a/b", false)).unwrap();
         assert!(check(OWNER, Scope::Install, &firewall("/a/b", false)).is_err());
         assert!(check(OWNER, Scope::Session, &firewall("/a/b", true)).is_err());
+        let opened = Change::Firewall {
+            program: "/a/b".to_string(),
+            ports: Vec::new(),
+            keep: false,
+            opened: vec![Port {
+                proto: Proto::Tcp,
+                port: 987,
+            }],
+        };
+        assert!(check(OWNER, Scope::Session, &opened).is_err());
         for program in ["", "a/b", "/a\nb", &format!("/{}", "a".repeat(2000))] {
             assert!(
                 check(OWNER, Scope::Session, &firewall(program, false)).is_err(),
@@ -293,6 +305,7 @@ mod tests {
             program: "/a/b".to_string(),
             ports,
             keep: false,
+            opened: Vec::new(),
         };
         check(
             OWNER,

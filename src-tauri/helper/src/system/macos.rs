@@ -52,6 +52,7 @@ pub fn programs(uid: u32) -> Option<Programs> {
     };
     Some(Programs {
         firewall: Some(Box::new(SocketFilter)),
+        port_firewall: None,
         low_ports: None,
         root: home.join(APP_DATA),
         uid: Some(uid),

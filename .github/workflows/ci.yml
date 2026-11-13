@@ -94,8 +94,10 @@ jobs:
           cp /etc/hosts "$RUNNER_TEMP/hosts.before"
           sudo target/debug/cabinet-helper install --uid "$(id -u)"
           systemctl is-active com.the-cabinet.helper.service
-          cargo test --workspace -- --ignored the_installed_helper_redirects_the_test_name_for_a_session
+          sudo ufw --force enable
+          CABINET_EXPECT_UFW=1 cargo test --workspace -- --ignored the_installed_helper_redirects_the_test_name_for_a_session
           sudo /usr/local/libexec/the-cabinet/com.the-cabinet.helper uninstall
+          ! sudo ufw status | grep tailscale0
           diff "$RUNNER_TEMP/hosts.before" /etc/hosts
           test ! -e /etc/systemd/system/com.the-cabinet.helper.service
           test ! -e /usr/local/libexec/the-cabinet

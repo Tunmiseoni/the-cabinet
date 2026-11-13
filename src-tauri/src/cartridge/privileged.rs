@@ -63,6 +63,7 @@ pub fn session_changes(
             program: program.clone(),
             ports: firewall.inbound.clone(),
             keep: false,
+            opened: Vec::new(),
         }));
     }
     Ok(changes)
@@ -114,7 +115,12 @@ fn unsupported(capabilities: &Capabilities) -> Vec<&'static str> {
             });
         }
     }
-    if capabilities.firewall.is_some() && !settled.contains(&"firewall") {
+    let firewall_on_linux = cfg!(target_os = "linux")
+        && capabilities
+            .firewall
+            .as_ref()
+            .is_some_and(|firewall| firewall.scope == ManifestScope::Session);
+    if capabilities.firewall.is_some() && !settled.contains(&"firewall") && !firewall_on_linux {
         items.push("firewall");
     }
     items
@@ -611,12 +617,14 @@ pub(crate) mod tests {
                 Change::Firewall {
                     program: "/store/service".to_string(),
                     ports: inbound.clone(),
-                    keep: false
+                    keep: false,
+                    opened: Vec::new(),
                 },
                 Change::Firewall {
                     program: "/store/game".to_string(),
                     ports: inbound,
-                    keep: false
+                    keep: false,
+                    opened: Vec::new(),
                 },
             ]
         );
@@ -652,7 +660,7 @@ pub(crate) mod tests {
             changes,
             vec![Change::LowPorts {
                 program: "/store/service".to_string(),
-                keep: false
+                keep: false,
             }]
         );
         host.release();
