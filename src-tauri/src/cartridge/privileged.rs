@@ -51,9 +51,10 @@ pub fn session_changes(
             target: service_ip(service)?,
         });
     }
-    if capabilities.firewall.is_some() {
+    if let Some(firewall) = &capabilities.firewall {
         changes.extend(programs.iter().map(|program| Change::Firewall {
             program: program.clone(),
+            ports: firewall.inbound.clone(),
             keep: false,
         }));
     }
@@ -236,14 +237,12 @@ impl Privileges {
 }
 
 #[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct SocketHelper {
     pub socket: std::path::PathBuf,
     pub installed: Option<std::path::PathBuf>,
 }
 
 #[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl SocketHelper {
     pub fn absent(&self) -> bool {
         self.installed.as_ref().is_some_and(|path| !path.exists())
@@ -269,7 +268,6 @@ impl SocketHelper {
 }
 
 #[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct SocketLease(cabinet_helper::client::Client);
 
 #[cfg(unix)]
@@ -306,7 +304,7 @@ impl Helper for SocketHelper {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn system_socket() -> SocketHelper {
     SocketHelper {
         socket: cabinet_helper::system::SOCKET.into(),
@@ -315,11 +313,11 @@ pub fn system_socket() -> SocketHelper {
 }
 
 pub fn system() -> Option<SharedHelper> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         Some(Arc::new(system_socket()))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
@@ -573,6 +571,7 @@ pub(crate) mod tests {
                 "/store/game".to_string(),
             ]);
         privileges.apply("").unwrap();
+        let inbound = capabilities.firewall.unwrap().inbound;
         let programs: Vec<Change> = applied
             .lock_or_recover()
             .iter()
@@ -583,10 +582,12 @@ pub(crate) mod tests {
             vec![
                 Change::Firewall {
                     program: "/store/service".to_string(),
+                    ports: inbound.clone(),
                     keep: false
                 },
                 Change::Firewall {
                     program: "/store/game".to_string(),
+                    ports: inbound,
                     keep: false
                 },
             ]

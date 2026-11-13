@@ -1,4 +1,3 @@
-#[cfg(unix)]
 pub mod client;
 pub mod engine;
 pub mod firewall;
@@ -6,9 +5,8 @@ pub mod hosts;
 pub mod journal;
 pub mod menu;
 pub mod protocol;
-#[cfg(unix)]
 pub mod server;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod system;
 
 use std::io::Write;
@@ -38,7 +36,7 @@ impl log::Log for StderrLog {
 const USAGE: &str =
     "usage: cabinet-helper daemon --uid <uid> | install --uid <uid> | uninstall | version";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn dispatch(args: &[&str]) -> Result<(), String> {
     let uid = |value: &str| {
         value
@@ -53,7 +51,7 @@ fn dispatch(args: &[&str]) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn dispatch(args: &[&str]) -> Result<(), String> {
     match args {
         ["daemon", ..] | ["install", ..] | ["uninstall"] => {

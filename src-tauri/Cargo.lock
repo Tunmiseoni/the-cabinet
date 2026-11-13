@@ -449,6 +449,7 @@ dependencies = [
 name = "cabinet-helper"
 version = "0.1.0"
 dependencies = [
+ "cabinet-cartridge",
  "libc",
  "log",
  "serde",

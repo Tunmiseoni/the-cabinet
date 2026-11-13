@@ -1,20 +1,28 @@
 use crate::engine::Engine;
 use crate::protocol::{self, Request, Response, Scope, MAX_LINE, VERSION};
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use unix::Server;
+
 const MAX_CONNECTIONS: usize = 32;
 
+#[cfg(unix)]
+pub type User = u32;
+#[cfg(not(unix))]
+pub type User = String;
+
 pub struct Config {
-    pub socket: PathBuf,
+    pub endpoint: PathBuf,
     pub state_dir: PathBuf,
     pub hosts: PathBuf,
-    pub uid: Option<u32>,
+    pub user: Option<User>,
     pub flush: bool,
     pub programs: Option<crate::firewall::Programs>,
 }
@@ -24,51 +32,17 @@ struct State {
     live: BTreeSet<String>,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     state: Mutex<State>,
     connections: AtomicUsize,
-    uid: Option<u32>,
+    pub(crate) user: Option<User>,
 }
 
-impl Shared {
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|err| err.into_inner())
-    }
-}
+pub(crate) struct Admitted(pub(crate) Arc<Shared>);
 
-pub struct Server {
-    listener: UnixListener,
-    shared: Arc<Shared>,
-}
-
-fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
-    let fd = stream.as_raw_fd();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        let result = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                &mut cred as *mut libc::ucred as *mut libc::c_void,
-                &mut len,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(cred.uid)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        let mut uid: libc::uid_t = 0;
-        let mut gid: libc::gid_t = 0;
-        if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(uid)
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -85,6 +59,38 @@ fn done(undone: usize, failures: Vec<String>) -> Result<Response, String> {
 }
 
 impl Shared {
+    pub(crate) fn open(config: Config) -> Result<Self, String> {
+        std::fs::create_dir_all(&config.state_dir)
+            .map_err(|err| format!("cannot create {}: {err}", config.state_dir.display()))?;
+        let mut engine = Engine::open(&config.state_dir, &config.hosts, config.flush)?
+            .with_programs(config.programs);
+        let (undone, failures) = engine.sweep(|_| false);
+        if undone > 0 || !failures.is_empty() {
+            log::info!("startup sweep: {undone} undone, {} failed", failures.len());
+        }
+        Ok(Self {
+            state: Mutex::new(State {
+                engine,
+                live: BTreeSet::new(),
+            }),
+            connections: AtomicUsize::new(0),
+            user: config.user,
+        })
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    pub(crate) fn admit(self: &Arc<Self>) -> Option<Admitted> {
+        if self.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            self.connections.fetch_sub(1, Ordering::SeqCst);
+            log::warn!("too many connections; dropping one");
+            return None;
+        }
+        Some(Admitted(Arc::clone(self)))
+    }
+
     fn release(&self, held: &mut Vec<String>) -> Result<Response, String> {
         let mut state = self.state();
         let ids = std::mem::take(held);
@@ -137,14 +143,11 @@ impl Shared {
         })
     }
 
-    fn converse(&self, stream: UnixStream) -> std::io::Result<()> {
-        let uid = peer_uid(&stream)?;
-        if self.uid.is_some_and(|allowed| uid != allowed && uid != 0) {
-            log::warn!("refusing a connection from uid {uid}");
-            return Ok(());
-        }
-        let mut writer = stream.try_clone()?;
-        let mut reader = BufReader::new(stream);
+    pub(crate) fn converse(
+        &self,
+        mut reader: impl BufRead,
+        mut writer: impl Write,
+    ) -> std::io::Result<()> {
         let mut held = Vec::new();
         let result = (|| loop {
             let mut line = String::new();
@@ -159,6 +162,7 @@ impl Shared {
                 },
             };
             writer.write_all(format!("{}\n", protocol::encode(&response)).as_bytes())?;
+            writer.flush()?;
         })();
         if !held.is_empty() {
             log::info!("a caller left without releasing; undoing {held:?}");
@@ -167,74 +171,5 @@ impl Shared {
             }
         }
         result
-    }
-}
-
-impl Server {
-    pub fn bind(config: Config) -> Result<Self, String> {
-        std::fs::create_dir_all(&config.state_dir)
-            .map_err(|err| format!("cannot create {}: {err}", config.state_dir.display()))?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&config.state_dir, std::fs::Permissions::from_mode(0o700));
-        }
-        let mut engine = Engine::open(&config.state_dir, &config.hosts, config.flush)?
-            .with_programs(config.programs);
-        let (undone, failures) = engine.sweep(|_| false);
-        if undone > 0 || !failures.is_empty() {
-            log::info!("startup sweep: {undone} undone, {} failed", failures.len());
-        }
-        let _ = std::fs::remove_file(&config.socket);
-        let listener = UnixListener::bind(&config.socket)
-            .and_then(|listener| {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(0o600))?;
-                Ok(listener)
-            })
-            .map_err(|err| format!("cannot listen on {}: {err}", config.socket.display()))?;
-        if let Some(uid) = config.uid {
-            std::os::unix::fs::chown(&config.socket, Some(uid), None).map_err(|err| {
-                format!(
-                    "cannot hand {} to uid {uid}: {err}",
-                    config.socket.display()
-                )
-            })?;
-        }
-        Ok(Self {
-            listener,
-            shared: Arc::new(Shared {
-                state: Mutex::new(State {
-                    engine,
-                    live: BTreeSet::new(),
-                }),
-                connections: AtomicUsize::new(0),
-                uid: config.uid,
-            }),
-        })
-    }
-
-    pub fn run(self) {
-        for stream in self.listener.incoming() {
-            let stream = match stream {
-                Ok(stream) => stream,
-                Err(err) => {
-                    log::warn!("cannot accept a connection: {err}");
-                    continue;
-                }
-            };
-            if self.shared.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                self.shared.connections.fetch_sub(1, Ordering::SeqCst);
-                log::warn!("too many connections; dropping one");
-                continue;
-            }
-            let shared = Arc::clone(&self.shared);
-            std::thread::spawn(move || {
-                if let Err(err) = shared.converse(stream) {
-                    log::warn!("a connection failed: {err}");
-                }
-                shared.connections.fetch_sub(1, Ordering::SeqCst);
-            });
-        }
     }
 }

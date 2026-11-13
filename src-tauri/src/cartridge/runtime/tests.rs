@@ -502,10 +502,10 @@ impl FakeSystem {
         };
         std::fs::write(&system.hosts, Self::HOSTS).unwrap();
         let server = cabinet_helper::server::Server::bind(cabinet_helper::server::Config {
-            socket: system.socket.clone(),
+            endpoint: system.socket.clone(),
             state_dir: dir.join("state"),
             hosts: system.hosts.clone(),
-            uid: None,
+            user: None,
             flush: false,
             programs: Some(cabinet_helper::firewall::Programs {
                 firewall: Box::new(system.firewall.clone()),
@@ -621,6 +621,7 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
             cabinet_helper::protocol::Scope::Session,
             &cabinet_helper::protocol::Change::Firewall {
                 program: allowed(&during)[0].clone(),
+                ports: Vec::new(),
                 keep: false,
             },
         )
@@ -643,12 +644,108 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
                 cabinet_helper::protocol::Scope::Session,
                 &cabinet_helper::protocol::Change::Firewall {
                     program: program.to_string(),
+                    ports: Vec::new(),
                     keep: false,
                 },
             )
             .unwrap_err();
     }
     assert_eq!(firewall_apps(), apps_before);
+
+    let crashed = system.leave_a_redirect(&bench.installed.cartridge);
+    drop(crashed);
+    settled("a crashed caller's redirect is undone", 0);
+    assert_eq!(system.hosts(), before);
+
+    let _held = system.leave_a_redirect(&bench.installed.cartridge);
+    let problems = crate::cartridge::install::uninstall(
+        &mut bench.store.lock_or_recover(),
+        &bench.installed.cartridge,
+        platform(),
+        &bench.scratch.path("logs"),
+        bench.helper.as_deref(),
+        None,
+    )
+    .unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(system.hosts(), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs The Cabinet's helper installed on this machine; it edits /etc/hosts"]
+fn the_installed_helper_redirects_the_test_name_for_a_session() {
+    use std::net::ToSocketAddrs;
+    let system = FakeSystem {
+        socket: cabinet_helper::system::SOCKET.into(),
+        hosts: cabinet_helper::system::HOSTS.into(),
+        firewall: FakeFirewall::default(),
+    };
+    let before = system.hosts();
+    assert_eq!(system.redirects(), 0, "{before}");
+    let resolves_to_loopback = || {
+        ("cabinet-test.invalid", 0)
+            .to_socket_addrs()
+            .map(|mut found| found.any(|address| address.ip() == Ipv4Addr::LOCALHOST))
+            .unwrap_or(false)
+    };
+    assert!(
+        !resolves_to_loopback(),
+        "the test name resolves before the session"
+    );
+    let scratch_dir = Scratch::new("rt-live-helper-scratch");
+    let app_data = crate::env::home_dir()
+        .unwrap()
+        .join(cabinet_helper::system::APP_DATA);
+    let (mut bench, _) = test_cartridge_in(
+        Scratch::at(app_data.join(format!("live-test-{}", std::process::id()))),
+        Map::from_iter([(
+            "scratch_dir".to_string(),
+            json!(scratch_dir.path("").to_string_lossy()),
+        )]),
+    );
+    bench.helper = crate::cartridge::privileged::system();
+    let settled = |what: &str, wanted: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while system.redirects() != wanted {
+            assert!(Instant::now() < deadline, "{what}: {}", system.hosts());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let host = bench.host("nHOST");
+    let member = bench.join(&host, "nMEMBER", "friend").unwrap();
+    assert_eq!(system.redirects(), 0);
+    block_on(host.start()).unwrap();
+    eventually("both sides ready", &host, |view| {
+        view.room.members.iter().all(|m| m.status == Status::Ready)
+    });
+    assert_eq!(system.redirects(), 2, "{}", system.hosts());
+    assert!(
+        resolves_to_loopback(),
+        "the test name does not resolve during the session"
+    );
+    block_on(member.stop());
+    assert_eq!(system.redirects(), 1, "{}", system.hosts());
+    block_on(host.stop());
+    assert_eq!(system.hosts(), before);
+    assert!(
+        !resolves_to_loopback(),
+        "the test name still resolves after the session"
+    );
+
+    let mut outsider = cabinet_helper::client::Client::connect(&system.socket).unwrap();
+    outsider
+        .apply(
+            &crate::cartridge::privileged::owner(&bench.installed.cartridge),
+            cabinet_helper::protocol::Scope::Session,
+            &cabinet_helper::protocol::Change::Hosts {
+                names: vec!["api.example-game.net".to_string()],
+                target: Ipv4Addr::LOCALHOST,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(system.hosts(), before);
 
     let crashed = system.leave_a_redirect(&bench.installed.cartridge);
     drop(crashed);

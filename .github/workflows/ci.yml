@@ -86,6 +86,22 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Prove the installed helper (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        working-directory: src-tauri
+        run: |
+          cargo build --bin cabinet-helper
+          cp /etc/hosts "$RUNNER_TEMP/hosts.before"
+          sudo target/debug/cabinet-helper install --uid "$(id -u)"
+          systemctl is-active com.the-cabinet.helper.service
+          cargo test --workspace -- --ignored the_installed_helper_redirects_the_test_name_for_a_session
+          sudo /usr/local/libexec/the-cabinet/com.the-cabinet.helper uninstall
+          diff "$RUNNER_TEMP/hosts.before" /etc/hosts
+          test ! -e /etc/systemd/system/com.the-cabinet.helper.service
+          test ! -e /usr/local/libexec/the-cabinet
+          test ! -e /var/lib/com.the-cabinet.helper
+          test ! -e /run/com.the-cabinet.helper.sock
+
       - name: Build echo-cart
         working-directory: src-tauri
         run: cargo build --release -p echo-cart

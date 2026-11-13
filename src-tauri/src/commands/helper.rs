@@ -13,7 +13,7 @@ pub struct HelperStatus {
     pub error: Option<String>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod system {
     use super::HelperStatus;
     use crate::cartridge::privileged;
@@ -22,6 +22,7 @@ mod system {
     use std::path::{Path, PathBuf};
 
     const BUNDLED: &str = "cabinet-helper";
+    #[cfg(target_os = "macos")]
     const SCRIPT: &[&str] = &[
         "on run argv",
         "set command to \"\"",
@@ -64,6 +65,7 @@ mod system {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn as_admin(prompt: &str, program: &Path, args: &[&str]) -> crate::error::Result<()> {
         let mut command = crate::process::command("/usr/bin/osascript");
         for line in SCRIPT {
@@ -80,11 +82,77 @@ mod system {
         Err(format!("the helper could not be changed: {}", stderr.trim()).into())
     }
 
+    #[cfg(target_os = "linux")]
+    fn as_admin(prompt: &str, program: &Path, args: &[&str]) -> crate::error::Result<()> {
+        log::info!("{prompt}");
+        let output = crate::process::command(PKEXEC)
+            .arg(program)
+            .args(args)
+            .output()
+            .map_err(|err| format!("cannot run {PKEXEC}: {err}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match output.status.code() {
+            Some(126) => Err("the administrator prompt was cancelled".into()),
+            Some(127) => Err(format!(
+                "the administrator prompt was refused or no authentication agent is running: {}",
+                stderr.trim()
+            )
+            .into()),
+            _ => Err(format!("the helper could not be changed: {}", stderr.trim()).into()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const PKEXEC: &str = "/usr/bin/pkexec";
+
+    #[cfg(target_os = "linux")]
+    struct Staged(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl Staged {
+        fn copy(source: &Path) -> crate::error::Result<Self> {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            let dir =
+                std::env::temp_dir().join(format!("the-cabinet-helper-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+            let staged = Self(dir);
+            let program = staged.program();
+            std::fs::copy(source, &program)?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+            Ok(staged)
+        }
+
+        fn program(&self) -> PathBuf {
+            self.0.join(BUNDLED)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const INSTALL_PROMPT: &str = "The Cabinet wants to install its helper, which makes the system changes a cartridge was approved for and undoes them afterwards.";
+
+    #[cfg(target_os = "macos")]
     pub fn install() -> crate::error::Result<()> {
         let uid = unsafe { libc::getuid() }.to_string();
+        as_admin(INSTALL_PROMPT, &bundled()?, &["install", "--uid", &uid])
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn install() -> crate::error::Result<()> {
+        let uid = unsafe { libc::getuid() }.to_string();
+        let staged = Staged::copy(&bundled()?)?;
         as_admin(
-            "The Cabinet wants to install its helper, which makes the system changes a cartridge was approved for and undoes them afterwards.",
-            &bundled()?,
+            INSTALL_PROMPT,
+            &staged.program(),
             &["install", "--uid", &uid],
         )
     }
@@ -98,7 +166,7 @@ mod system {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod system {
     use super::HelperStatus;
 

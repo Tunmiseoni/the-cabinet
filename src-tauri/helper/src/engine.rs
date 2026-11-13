@@ -47,6 +47,7 @@ impl Engine {
                 Change::Firewall {
                     program: held,
                     keep,
+                    ..
                 } if held == program => Some(*keep),
                 _ => None,
             })
@@ -72,7 +73,7 @@ impl Engine {
         menu::check(owner, scope, &change)?;
         let mut allow = false;
         let change = match change {
-            Change::Firewall { program, .. } => {
+            Change::Firewall { program, ports, .. } => {
                 let programs = self.programs()?;
                 let program = programs.resolve(&program)?;
                 let keep = match self.holds_program(&program) {
@@ -84,7 +85,22 @@ impl Engine {
                         keep
                     }
                 };
-                Change::Firewall { program, keep }
+                Change::Firewall {
+                    program,
+                    ports,
+                    keep,
+                }
+            }
+            Change::LowPorts { .. } => {
+                return Err("this helper cannot grant low ports on this system".to_string())
+            }
+            Change::TrustCa {
+                certificate, names, ..
+            } => {
+                menu::check_certificate(&certificate, &names, (now_ms() / 1000) as i64)?;
+                return Err(
+                    "this helper cannot trust certificate authorities on this system".to_string(),
+                );
             }
             other => other,
         };
@@ -117,7 +133,7 @@ impl Engine {
                     }
                 }
             }
-            Change::Firewall { .. } => {}
+            Change::Firewall { .. } | Change::LowPorts { .. } | Change::TrustCa { .. } => {}
         }
         let entry = self.journal.add(owner, scope, change, now_ms())?;
         let applied = match &entry.change {
@@ -127,7 +143,7 @@ impl Engine {
             Change::Firewall { program, .. } if allow => self
                 .programs()
                 .and_then(|programs| programs.firewall.allow(program)),
-            Change::Firewall { .. } => Ok(()),
+            Change::Firewall { .. } | Change::LowPorts { .. } | Change::TrustCa { .. } => Ok(()),
         };
         if let Err(err) = applied {
             if let Err(journal) = self.journal.remove(&entry.id) {
@@ -150,7 +166,7 @@ impl Engine {
         };
         match &entry.change {
             Change::Hosts { .. } => self.rewrite_hosts(|text| hosts::remove(text, &entry.id))?,
-            Change::Firewall { program, keep } => {
+            Change::Firewall { program, keep, .. } => {
                 let shared = self.journal.entries().iter().any(|other| {
                     other.id != entry.id
                         && matches!(&other.change, Change::Firewall { program: held, .. } if held == program)
@@ -158,6 +174,9 @@ impl Engine {
                 if !keep && !shared {
                     self.programs()?.firewall.remove(program)?;
                 }
+            }
+            Change::LowPorts { .. } | Change::TrustCa { .. } => {
+                return Err("this helper cannot undo that change on this system".to_string())
             }
         }
         self.journal.remove(id)?;
@@ -245,6 +264,7 @@ pub(crate) mod tests {
     fn firewall(program: &str) -> Change {
         Change::Firewall {
             program: program.to_string(),
+            ports: Vec::new(),
             keep: false,
         }
     }
@@ -302,6 +322,7 @@ pub(crate) mod tests {
             entry.change,
             Change::Firewall {
                 program: program.clone(),
+                ports: Vec::new(),
                 keep: true
             }
         );
