@@ -123,6 +123,7 @@ mod tests {
             user: None,
             flush: false,
             programs: None,
+            anchors: None,
         })
         .unwrap();
         std::thread::spawn(move || server.run());

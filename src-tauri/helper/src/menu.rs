@@ -173,9 +173,12 @@ fn is_windows_absolute(path: &str) -> bool {
         && bytes[2] == b'\\'
 }
 
-pub fn check_certificate(certificate: &str, names: &[String], now: i64) -> Result<(), String> {
+pub fn check_certificate(
+    certificate: &str,
+    names: &[String],
+    now: i64,
+) -> Result<cabinet_cartridge::ca::Ca, String> {
     cabinet_cartridge::ca::check(certificate.as_bytes(), names, now)
-        .map(|_| ())
         .map_err(|err| format!("the certificate authority is refused: {err}"))
 }
 

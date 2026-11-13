@@ -101,6 +101,7 @@ pub fn daemon(uid: u32) -> Result<(), String> {
         user: Some(uid),
         flush: true,
         programs: programs(uid),
+        anchors: None,
     })?;
     log::info!("listening on {SOCKET} for uid {uid}");
     server.run();

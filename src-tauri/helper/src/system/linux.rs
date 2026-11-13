@@ -52,6 +52,14 @@ pub fn programs(uid: u32) -> Option<Programs> {
     })
 }
 
+fn anchors() -> Option<Box<dyn crate::anchors::Anchors>> {
+    let found = crate::anchors::DirAnchors::system();
+    if found.is_none() {
+        log::warn!("no system certificate folder found; certificate authorities are off");
+    }
+    found.map(|anchors| Box::new(anchors) as Box<dyn crate::anchors::Anchors>)
+}
+
 fn installed_uid() -> Option<u32> {
     std::fs::read_to_string(UNIT)
         .ok()?
@@ -94,6 +102,7 @@ pub fn daemon(uid: u32) -> Result<(), String> {
         user: Some(uid),
         flush: false,
         programs: programs(uid),
+        anchors: anchors(),
     })?;
     log::info!("listening on {SOCKET} for uid {uid}");
     server.run();
@@ -132,9 +141,11 @@ pub fn uninstall() -> Result<(), String> {
     let _ = systemctl(&["disable", "--now", &service()]);
     let mut problems = Vec::new();
     if Path::new(STATE_DIR).exists() {
-        match Engine::open(Path::new(STATE_DIR), Path::new(HOSTS), false)
-            .map(|engine| engine.with_programs(uid.and_then(programs)))
-        {
+        match Engine::open(Path::new(STATE_DIR), Path::new(HOSTS), false).map(|engine| {
+            engine
+                .with_programs(uid.and_then(programs))
+                .with_anchors(anchors())
+        }) {
             Ok(mut engine) => {
                 let (_, failures) = engine.undo_where(|_| true);
                 problems.extend(failures);

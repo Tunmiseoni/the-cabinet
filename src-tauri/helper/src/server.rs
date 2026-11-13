@@ -27,6 +27,7 @@ pub struct Config {
     pub user: Option<User>,
     pub flush: bool,
     pub programs: Option<crate::firewall::Programs>,
+    pub anchors: Option<Box<dyn crate::anchors::Anchors>>,
 }
 
 struct State {
@@ -65,7 +66,8 @@ impl Shared {
         std::fs::create_dir_all(&config.state_dir)
             .map_err(|err| format!("cannot create {}: {err}", config.state_dir.display()))?;
         let mut engine = Engine::open(&config.state_dir, &config.hosts, config.flush)?
-            .with_programs(config.programs);
+            .with_programs(config.programs)
+            .with_anchors(config.anchors);
         let (undone, failures) = engine.sweep(|_| false);
         if undone > 0 || !failures.is_empty() {
             log::info!("startup sweep: {undone} undone, {} failed", failures.len());

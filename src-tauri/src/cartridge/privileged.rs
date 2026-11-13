@@ -94,6 +94,14 @@ fn settled(capabilities: &Capabilities) -> Vec<&'static str> {
             items.push("firewall");
         }
     }
+    if cfg!(target_os = "linux")
+        && capabilities
+            .trust_ca
+            .as_ref()
+            .is_some_and(|ca| ca.stores == [CaStore::System])
+    {
+        items.push("trust_ca");
+    }
     items
 }
 

@@ -8,6 +8,35 @@ pub struct Ca {
     pub sha256: String,
     pub subject: String,
     pub not_after: i64,
+    pub permitted: Vec<String>,
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub fn pem(der: &[u8]) -> String {
+    let mut encoded = String::new();
+    for chunk in der.chunks(3) {
+        let bytes = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let joined = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+        for index in 0..4 {
+            if index <= chunk.len() {
+                encoded.push(BASE64[(joined >> (18 - 6 * index) & 63) as usize] as char);
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    let mut text = String::from("-----BEGIN CERTIFICATE-----\n");
+    for line in encoded.as_bytes().chunks(64) {
+        text.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        text.push('\n');
+    }
+    text.push_str("-----END CERTIFICATE-----\n");
+    text
 }
 
 fn der(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -114,6 +143,7 @@ pub fn check(bytes: &[u8], permitted_names: &[String], now: i64) -> Result<Ca, S
             .collect(),
         subject: cert.subject().to_string(),
         not_after,
+        permitted,
         der,
     })
 }
@@ -138,6 +168,7 @@ mod tests {
         let pem = check(include_bytes!("fixtures/ca-good.pem"), &names(&[NAME]), NOW).unwrap();
         let der = check(include_bytes!("fixtures/ca-good.der"), &names(&[NAME]), NOW).unwrap();
         assert_eq!(pem, der);
+        assert_eq!(pem.permitted, names(&[NAME]));
         assert_eq!(pem.subject, "CN=Cabinet fixture good");
         assert_eq!(pem.sha256.len(), 64);
         check(
@@ -214,5 +245,17 @@ mod tests {
         let mut trailing = include_bytes!("fixtures/ca-good.der").to_vec();
         trailing.push(0);
         assert!(refused(&trailing, &[NAME]).contains("after the certificate"));
+    }
+
+    #[test]
+    fn writes_a_certificate_back_as_pem() {
+        let ca = check(include_bytes!("fixtures/ca-good.der"), &names(&[NAME]), NOW).unwrap();
+        let text = super::pem(&ca.der);
+        assert_eq!(
+            text.replace('\n', ""),
+            String::from_utf8_lossy(include_bytes!("fixtures/ca-good.pem")).replace('\n', "")
+        );
+        assert_eq!(check(text.as_bytes(), &names(&[NAME]), NOW).unwrap(), ca);
+        assert!(text.lines().all(|line| line.len() <= 64));
     }
 }

@@ -1,3 +1,4 @@
+use crate::anchors::Anchors;
 use crate::firewall::{AppFirewall, PortFirewall, Programs};
 use crate::hosts;
 use crate::journal::Journal;
@@ -11,6 +12,7 @@ pub struct Engine {
     hosts: PathBuf,
     flush: bool,
     programs: Option<Programs>,
+    anchors: Option<Box<dyn Anchors>>,
 }
 
 fn now_ms() -> u64 {
@@ -26,12 +28,24 @@ impl Engine {
             hosts: hosts.to_path_buf(),
             flush,
             programs: None,
+            anchors: None,
         })
     }
 
     pub fn with_programs(mut self, programs: Option<Programs>) -> Self {
         self.programs = programs;
         self
+    }
+
+    pub fn with_anchors(mut self, anchors: Option<Box<dyn Anchors>>) -> Self {
+        self.anchors = anchors;
+        self
+    }
+
+    fn anchors(&self) -> Result<&dyn Anchors, String> {
+        self.anchors.as_deref().ok_or_else(|| {
+            "this helper cannot trust certificate authorities on this system".to_string()
+        })
     }
 
     fn firewall(&self) -> Result<(&Programs, &dyn AppFirewall), String> {
@@ -157,10 +171,13 @@ impl Engine {
             Change::TrustCa {
                 certificate, names, ..
             } => {
-                menu::check_certificate(&certificate, &names, (now_ms() / 1000) as i64)?;
-                return Err(
-                    "this helper cannot trust certificate authorities on this system".to_string(),
-                );
+                let ca = menu::check_certificate(&certificate, &names, (now_ms() / 1000) as i64)?;
+                self.anchors()?;
+                Change::TrustCa {
+                    certificate: cabinet_cartridge::ca::pem(&ca.der),
+                    names,
+                    anchor: String::new(),
+                }
             }
             other => other,
         };
@@ -195,7 +212,22 @@ impl Engine {
             }
             Change::Firewall { .. } | Change::LowPorts { .. } | Change::TrustCa { .. } => {}
         }
-        let entry = self.journal.add(owner, scope, change, now_ms())?;
+        let mut entry = self.journal.add(owner, scope, change, now_ms())?;
+        if matches!(entry.change, Change::TrustCa { .. }) {
+            let path = self.anchors().and_then(|anchors| anchors.path(&entry.id));
+            let recorded = path.and_then(|path| {
+                if let Change::TrustCa { anchor, .. } = &mut entry.change {
+                    *anchor = path;
+                }
+                self.journal.replace(entry.clone())
+            });
+            if let Err(err) = recorded {
+                if let Err(journal) = self.journal.remove(&entry.id) {
+                    log::error!("cannot drop the journal entry for a failed change: {journal}");
+                }
+                return Err(err);
+            }
+        }
         let applied = match &entry.change {
             Change::Hosts { names, target } => {
                 self.rewrite_hosts(|text| hosts::add(text, &entry.id, names, *target))
@@ -207,7 +239,14 @@ impl Engine {
             Change::LowPorts { program, .. } if act => {
                 self.low_ports().and_then(|(_, grant)| grant.grant(program))
             }
-            Change::Firewall { .. } | Change::LowPorts { .. } | Change::TrustCa { .. } => Ok(()),
+            Change::TrustCa {
+                certificate,
+                anchor,
+                ..
+            } => self
+                .anchors()
+                .and_then(|anchors| anchors.place(anchor, certificate)),
+            Change::Firewall { .. } | Change::LowPorts { .. } => Ok(()),
         };
         if let Err(err) = applied {
             if let Err(journal) = self.journal.remove(&entry.id) {
@@ -300,8 +339,14 @@ impl Engine {
                     self.low_ports()?.1.revoke(program)?;
                 }
             }
-            Change::TrustCa { .. } => {
-                return Err("this helper cannot undo that change on this system".to_string())
+            Change::TrustCa {
+                certificate,
+                anchor,
+                ..
+            } => {
+                if !anchor.is_empty() {
+                    self.anchors()?.remove(anchor, certificate)?;
+                }
             }
         }
         self.journal.remove(id)?;
@@ -543,6 +588,46 @@ pub(crate) mod tests {
                 }
             )
             .is_err());
+    }
+
+    #[test]
+    fn a_certificate_authority_is_placed_for_its_install_and_removed_with_it() {
+        let scratch = Scratch::new("trust");
+        let anchors = crate::anchors::tests::anchors(&scratch);
+        let dir = anchors.dir.clone();
+        let mut engine = scratch.engine().with_anchors(Some(Box::new(anchors)));
+        let trust = |names: &[&str]| Change::TrustCa {
+            certificate: include_str!("../../cartridge/src/fixtures/ca-good.pem").to_string(),
+            names: names.iter().map(|name| name.to_string()).collect(),
+            anchor: String::new(),
+        };
+        let entry = engine.apply(OWNER, Scope::Install, trust(&[NAME])).unwrap();
+        let Change::TrustCa {
+            certificate,
+            anchor,
+            ..
+        } = &entry.change
+        else {
+            panic!("{entry:?}");
+        };
+        assert_eq!(engine.entries()[0], entry);
+        assert_eq!(std::fs::read_to_string(anchor).unwrap(), *certificate);
+        assert!(anchor.starts_with(dir.to_str().unwrap()));
+        let (undone, failures) = engine.sweep(|_| false);
+        assert_eq!((undone, failures.len()), (0, 0));
+        assert!(std::path::Path::new(anchor).exists());
+        let (undone, failures) = engine.undo_where(|held| held.owner == OWNER);
+        assert_eq!((undone, failures.len()), (1, 0));
+        assert!(!std::path::Path::new(anchor).exists());
+        assert!(engine.entries().is_empty());
+
+        assert!(engine
+            .apply(OWNER, Scope::Install, trust(&["other.invalid"]))
+            .is_err());
+        let mut plain = scratch.engine();
+        assert!(plain.apply(OWNER, Scope::Install, trust(&[NAME])).is_err());
+        assert!(plain.entries().is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

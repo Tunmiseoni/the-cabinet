@@ -565,6 +565,7 @@ impl FakeSystem {
                 root: scratch.path("app"),
                 uid: None,
             }),
+            anchors: None,
         })
         .unwrap();
         std::thread::spawn(move || server.run());

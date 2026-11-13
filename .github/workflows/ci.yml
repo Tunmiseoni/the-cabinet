@@ -95,9 +95,10 @@ jobs:
           sudo target/debug/cabinet-helper install --uid "$(id -u)"
           systemctl is-active com.the-cabinet.helper.service
           sudo ufw --force enable
-          CABINET_EXPECT_UFW=1 cargo test --workspace -- --ignored the_installed_helper_redirects_the_test_name_for_a_session
+          CABINET_EXPECT_UFW=1 cargo test --workspace -- --ignored --test-threads=1 the_installed_helper_
           sudo /usr/local/libexec/the-cabinet/com.the-cabinet.helper uninstall
-          ! sudo ufw status | grep tailscale0
+          if sudo ufw status | grep tailscale0; then exit 1; fi
+          if ls /usr/local/share/ca-certificates/the-cabinet-* 2>/dev/null; then exit 1; fi
           diff "$RUNNER_TEMP/hosts.before" /etc/hosts
           test ! -e /etc/systemd/system/com.the-cabinet.helper.service
           test ! -e /usr/local/libexec/the-cabinet

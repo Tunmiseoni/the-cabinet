@@ -326,12 +326,62 @@ impl TrustStore for Keychain {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub struct HelperTrust(pub super::privileged::SocketHelper);
+
+#[cfg(target_os = "linux")]
+impl HelperTrust {
+    fn owner(sha256: &str) -> String {
+        format!(
+            "ca/{}",
+            sha256.get(..16).unwrap_or(sha256).to_ascii_lowercase()
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl TrustStore for HelperTrust {
+    fn trust(&self, ca: &Ca) -> Result<(), String> {
+        let change = cabinet_helper::protocol::Change::TrustCa {
+            certificate: ca::pem(&ca.der),
+            names: ca.permitted.clone(),
+            anchor: String::new(),
+        };
+        self.0
+            .connect()?
+            .apply(
+                &Self::owner(&ca.sha256),
+                cabinet_helper::protocol::Scope::Install,
+                &change,
+            )
+            .map(|_| ())
+    }
+
+    fn untrust(&self, sha256: &str, _der: &[u8]) -> Result<(), String> {
+        self.0.connect()?.forget(&Self::owner(sha256)).map(|_| ())
+    }
+
+    fn holds(&self, sha256: &str) -> Result<bool, String> {
+        let owner = Self::owner(sha256);
+        Ok(self
+            .0
+            .connect()?
+            .status()?
+            .iter()
+            .any(|entry| entry.owner == owner))
+    }
+}
+
 pub fn system() -> Option<SharedTrustStore> {
     #[cfg(target_os = "macos")]
     {
         Some(Arc::new(Keychain))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        Some(Arc::new(HelperTrust(super::privileged::system_socket())))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
