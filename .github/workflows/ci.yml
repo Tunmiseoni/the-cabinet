@@ -114,7 +114,7 @@ jobs:
           Run cargo build --bin cabinet-helper
           $password = ConvertTo-SecureString ("Cab-" + [guid]::NewGuid().ToString() + "-1a") -AsPlainText -Force
           New-LocalUser -Name cabinet-standard -Password $password -AccountNeverExpires | Out-Null
-          Add-LocalGroupMember -Group Users -Member cabinet-standard
+          Add-LocalGroupMember -Group Users -Member cabinet-standard -ErrorAction SilentlyContinue
           if (Get-LocalGroupMember Administrators | Where-Object Name -like '*\cabinet-standard') { throw "the test user is an administrator" }
           $credential = [pscredential]::new("$env:COMPUTERNAME\cabinet-standard", $password)
           $public = Join-Path $env:PUBLIC cabinet-bind
