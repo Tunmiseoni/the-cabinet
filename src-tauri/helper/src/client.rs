@@ -310,10 +310,13 @@ mod tests {
             }
         };
         let access = crate::win::access_of(&stream).unwrap();
-        assert_eq!(
-            access,
-            format!("D:P(A;;FA;;;SY)(A;;FA;;;{me})(A;;0x12008b;;;{me})"),
-        );
+        let expected = crate::win::Descriptor::parse(&format!(
+            "D:P(A;;FA;;;SY)(A;;FA;;;{me})(A;;0x12008b;;;{me})"
+        ))
+        .unwrap()
+        .access()
+        .unwrap();
+        assert_eq!(access, expected);
         assert_eq!(
             crate::server::access_list(crate::win::SYSTEM, &me),
             format!("D:P(A;;FA;;;S-1-5-18)(A;;0x12008b;;;{me})")

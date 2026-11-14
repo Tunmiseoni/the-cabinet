@@ -543,10 +543,11 @@ mod tests {
         assert!(client.status().unwrap().is_empty());
         let me = win::current_user().unwrap();
         let pipe = std::fs::OpenOptions::new().read(true).open(PIPE).unwrap();
-        assert_eq!(
-            win::access_of(&pipe).unwrap(),
-            format!("D:P(A;;FA;;;SY)(A;;0x12008b;;;{me})")
-        );
+        let expected = win::Descriptor::parse(&format!("D:P(A;;FA;;;SY)(A;;0x12008b;;;{me})"))
+            .unwrap()
+            .access()
+            .unwrap();
+        assert_eq!(win::access_of(&pipe).unwrap(), expected);
         drop(pipe);
         let state = state_dir().unwrap();
         let owner = win::owner_of(&state).unwrap();

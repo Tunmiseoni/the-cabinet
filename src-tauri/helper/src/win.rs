@@ -127,6 +127,10 @@ impl Descriptor {
         Ok(Self(Local(descriptor)))
     }
 
+    pub fn access(&self) -> Result<String, String> {
+        unsafe { access_text(self.0 .0) }
+    }
+
     pub fn attributes(&self) -> SECURITY_ATTRIBUTES {
         SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -179,6 +183,10 @@ pub fn access_of(handle: &impl AsRawHandle) -> Result<String, String> {
         return Err(error("cannot read an access list", status));
     }
     let _free = Local(descriptor);
+    unsafe { access_text(descriptor) }
+}
+
+unsafe fn access_text(descriptor: *mut c_void) -> Result<String, String> {
     let mut text: PWSTR = std::ptr::null_mut();
     if unsafe {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
