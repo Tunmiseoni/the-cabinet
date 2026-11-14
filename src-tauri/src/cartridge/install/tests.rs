@@ -743,10 +743,10 @@ fn verifies(dir: &Path, leaf: &str, name: &str) -> bool {
 fn the_login_keychain_trusts_a_cartridge_certificate_authority_while_it_is_installed() {
     let keychain = catrust::Keychain;
     let mut fixture = Fixture::new("ca-live");
-    fixture.now = crate::time::now_ms();
     let dir = fixture.scratch.path("ca");
     std::fs::create_dir_all(&dir).unwrap();
     let ca = throwaway_ca(&dir);
+    fixture.now = crate::time::now_ms();
     assert!(!verifies(&dir, "inside", "cabinet-test.invalid"));
 
     let signer = signer();
@@ -823,10 +823,10 @@ fn the_installed_helper_trusts_a_cartridge_certificate_authority_while_it_is_ins
     };
     assert!(anchors().is_empty());
     let mut fixture = Fixture::new("ca-live");
-    fixture.now = crate::time::now_ms();
     let dir = fixture.scratch.path("ca");
     std::fs::create_dir_all(&dir).unwrap();
     let ca = throwaway_ca(&dir);
+    fixture.now = crate::time::now_ms();
     assert!(!verifies(&dir, "inside", "cabinet-test.invalid"));
 
     let signer = signer();

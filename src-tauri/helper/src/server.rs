@@ -42,6 +42,7 @@ struct State {
 pub(crate) struct Shared {
     state: Mutex<State>,
     connections: AtomicUsize,
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) user: Option<User>,
 }
 
