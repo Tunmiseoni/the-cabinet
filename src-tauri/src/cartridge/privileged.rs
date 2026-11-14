@@ -94,7 +94,10 @@ fn settled(capabilities: &Capabilities) -> Vec<&'static str> {
             items.push("firewall");
         }
     }
-    if cfg!(target_os = "linux")
+    if cfg!(windows) && !capabilities.low_ports.is_empty() {
+        items.push("low_ports");
+    }
+    if cfg!(any(target_os = "linux", windows))
         && capabilities
             .trust_ca
             .as_ref()
@@ -123,12 +126,13 @@ fn unsupported(capabilities: &Capabilities) -> Vec<&'static str> {
             });
         }
     }
-    let firewall_on_linux = cfg!(target_os = "linux")
+    let firewall_through_helper = cfg!(any(target_os = "linux", windows))
         && capabilities
             .firewall
             .as_ref()
             .is_some_and(|firewall| firewall.scope == ManifestScope::Session);
-    if capabilities.firewall.is_some() && !settled.contains(&"firewall") && !firewall_on_linux {
+    if capabilities.firewall.is_some() && !settled.contains(&"firewall") && !firewall_through_helper
+    {
         items.push("firewall");
     }
     items
@@ -278,41 +282,90 @@ impl Privileges {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, test)))]
 pub struct SocketHelper {
     pub socket: std::path::PathBuf,
     pub installed: Option<std::path::PathBuf>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, test)))]
 impl SocketHelper {
     pub fn absent(&self) -> bool {
         self.installed.as_ref().is_some_and(|path| !path.exists())
     }
 
     pub fn connect(&self) -> Result<cabinet_helper::client::Client, String> {
-        let mut client = cabinet_helper::client::Client::connect(&self.socket).map_err(|err| {
+        let client = cabinet_helper::client::Client::connect(&self.socket).map_err(|err| {
             if self.absent() {
                 "The Cabinet's helper is not installed. Install it first; it asks for an administrator password once.".to_string()
             } else {
                 format!("The Cabinet's helper is not answering: {err}")
             }
         })?;
-        let version = client.hello()?;
-        if version != cabinet_helper::protocol::VERSION {
-            return Err(format!(
-                "The Cabinet's helper is out of date (version {version}, this app needs {}). Install it again.",
-                cabinet_helper::protocol::VERSION
-            ));
-        }
-        Ok(client)
+        current(client)
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn current(
+    mut client: cabinet_helper::client::Client,
+) -> Result<cabinet_helper::client::Client, String> {
+    let version = client.hello()?;
+    if version != cabinet_helper::protocol::VERSION {
+        return Err(format!(
+            "The Cabinet's helper is out of date (version {version}, this app needs {}). Install it again.",
+            cabinet_helper::protocol::VERSION
+        ));
+    }
+    Ok(client)
+}
+
+#[cfg(windows)]
+pub struct ServiceHelper;
+
+#[cfg(windows)]
+impl ServiceHelper {
+    pub fn absent(&self) -> bool {
+        !cabinet_helper::system::is_installed()
+    }
+
+    pub fn connect(&self) -> Result<cabinet_helper::client::Client, String> {
+        let client = cabinet_helper::system::connect().map_err(|err| {
+            if self.absent() {
+                "The Cabinet's helper is not installed. Install it first; Windows asks for an administrator's approval once.".to_string()
+            } else {
+                format!("The Cabinet's helper is not answering: {err}")
+            }
+        })?;
+        current(client)
+    }
+}
+
+#[cfg(windows)]
+impl Helper for ServiceHelper {
+    fn lease(&self) -> Result<Box<dyn Lease>, String> {
+        Ok(Box::new(SocketLease(self.connect()?)))
+    }
+
+    fn forget(&self, owner: &str) -> Result<usize, String> {
+        if self.absent() {
+            return Ok(0);
+        }
+        self.connect()?.forget(owner)
+    }
+
+    fn sweep(&self) -> Result<usize, String> {
+        if self.absent() {
+            return Ok(0);
+        }
+        self.connect()?.sweep()
+    }
+}
+
+#[cfg(any(unix, windows))]
 struct SocketLease(cabinet_helper::client::Client);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Lease for SocketLease {
     fn apply(&mut self, owner: &str, change: &Change) -> Result<(), String> {
         self.0
@@ -325,7 +378,7 @@ impl Lease for SocketLease {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, test)))]
 impl Helper for SocketHelper {
     fn lease(&self) -> Result<Box<dyn Lease>, String> {
         Ok(Box::new(SocketLease(self.connect()?)))
@@ -359,7 +412,11 @@ pub fn system() -> Option<SharedHelper> {
     {
         Some(Arc::new(system_socket()))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        Some(Arc::new(ServiceHelper))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         None
     }
@@ -677,16 +734,23 @@ pub(crate) mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn low_ports_are_not_built_off_macos() {
+    fn low_ports_need_no_change_on_windows() {
         let capabilities = Capabilities {
             low_ports: vec![443],
             ..hosts()
         };
-        let helper: SharedHelper = Arc::new(FakeHelper::default());
-        let err = privileges(Some(helper), &capabilities, Grant::Granted)
-            .check()
-            .unwrap_err();
-        assert!(err.contains("low_ports"), "{err}");
+        let helper = Arc::new(FakeHelper::default());
+        let applied = Arc::clone(&helper.applied);
+        let mut privileges = privileges(Some(helper), &capabilities, Grant::Granted)
+            .with_service_program(Some(r"C:\store\service.exe".to_string()));
+        privileges.check().unwrap();
+        privileges.apply("127.0.0.1").unwrap();
+        assert!(applied
+            .lock_or_recover()
+            .iter()
+            .all(|(_, change)| !matches!(change, Change::LowPorts { .. })));
+        assert_eq!(applied.lock_or_recover().len(), 1);
+        privileges.release();
     }
 
     #[test]

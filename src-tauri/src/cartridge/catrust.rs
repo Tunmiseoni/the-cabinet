@@ -372,6 +372,160 @@ impl TrustStore for HelperTrust {
     }
 }
 
+#[cfg(windows)]
+pub struct UserStore(pub String);
+
+#[cfg(windows)]
+pub(crate) struct OpenStore(pub(crate) windows_sys::Win32::Security::Cryptography::HCERTSTORE);
+
+#[cfg(windows)]
+impl Drop for OpenStore {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Security::Cryptography::CertCloseStore(self.0, 0) };
+    }
+}
+
+#[cfg(windows)]
+impl UserStore {
+    pub const ROOT: &'static str = "Root";
+
+    pub fn root() -> Self {
+        Self(Self::ROOT.to_string())
+    }
+
+    pub(crate) fn open(&self) -> Result<OpenStore, String> {
+        use windows_sys::Win32::Security::Cryptography::{
+            CertOpenStore, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER,
+        };
+        let name = cabinet_helper::win::wide(&self.0);
+        let handle = unsafe {
+            CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                0,
+                0,
+                CERT_SYSTEM_STORE_CURRENT_USER,
+                name.as_ptr().cast(),
+            )
+        };
+        if handle.is_null() {
+            return Err(cabinet_helper::win::last_error(&format!(
+                "cannot open your \"{}\" certificate store",
+                self.0
+            )));
+        }
+        Ok(OpenStore(handle))
+    }
+
+    fn find(
+        store: &OpenStore,
+        sha256: &str,
+    ) -> Option<*mut windows_sys::Win32::Security::Cryptography::CERT_CONTEXT> {
+        use sha2::{Digest, Sha256};
+        use windows_sys::Win32::Security::Cryptography::{
+            CertDuplicateCertificateContext, CertEnumCertificatesInStore,
+            CertFreeCertificateContext,
+        };
+        let mut previous = std::ptr::null();
+        loop {
+            let context = unsafe { CertEnumCertificatesInStore(store.0, previous) };
+            if context.is_null() {
+                return None;
+            }
+            let der = unsafe {
+                std::slice::from_raw_parts(
+                    (*context).pbCertEncoded,
+                    (*context).cbCertEncoded as usize,
+                )
+            };
+            if hex(&Sha256::digest(der)).eq_ignore_ascii_case(sha256) {
+                let found = unsafe { CertDuplicateCertificateContext(context) };
+                unsafe { CertFreeCertificateContext(context) };
+                return Some(found);
+            }
+            previous = context;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn declined(code: u32) -> bool {
+    code == windows_sys::Win32::Foundation::ERROR_CANCELLED || code == 0x8007_04C7
+}
+
+#[cfg(windows)]
+impl TrustStore for UserStore {
+    fn trust(&self, ca: &Ca) -> Result<(), String> {
+        use windows_sys::Win32::Foundation::CRYPT_E_EXISTS;
+        use windows_sys::Win32::Security::Cryptography::{
+            CertAddEncodedCertificateToStore, CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
+        };
+        let store = self.open()?;
+        let added = unsafe {
+            CertAddEncodedCertificateToStore(
+                store.0,
+                X509_ASN_ENCODING,
+                ca.der.as_ptr(),
+                ca.der.len() as u32,
+                CERT_STORE_ADD_NEW,
+                std::ptr::null_mut(),
+            )
+        };
+        if added == 0 {
+            let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            if declined(code) {
+                return Err(
+                    "Windows did not trust the certificate: the prompt was declined".to_string(),
+                );
+            }
+            if code != CRYPT_E_EXISTS as u32 {
+                return Err(format!(
+                    "Windows did not trust the certificate: {}",
+                    std::io::Error::from_raw_os_error(code as i32)
+                ));
+            }
+        }
+        if self.holds(&ca.sha256)? {
+            Ok(())
+        } else {
+            Err("Windows did not keep the certificate".to_string())
+        }
+    }
+
+    fn untrust(&self, sha256: &str, _der: &[u8]) -> Result<(), String> {
+        use windows_sys::Win32::Security::Cryptography::CertDeleteCertificateFromStore;
+        let store = self.open()?;
+        let Some(found) = Self::find(&store, sha256) else {
+            return Ok(());
+        };
+        if unsafe { CertDeleteCertificateFromStore(found) } == 0 {
+            let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            if declined(code) {
+                return Err(
+                    "Windows kept the certificate trusted: the prompt was declined".to_string(),
+                );
+            }
+            return Err(format!(
+                "cannot remove the certificate: {}",
+                std::io::Error::from_raw_os_error(code as i32)
+            ));
+        }
+        Ok(())
+    }
+
+    fn holds(&self, sha256: &str) -> Result<bool, String> {
+        let store = self.open()?;
+        Ok(match Self::find(&store, sha256) {
+            Some(found) => {
+                unsafe {
+                    windows_sys::Win32::Security::Cryptography::CertFreeCertificateContext(found)
+                };
+                true
+            }
+            None => false,
+        })
+    }
+}
+
 pub fn system() -> Option<SharedTrustStore> {
     #[cfg(target_os = "macos")]
     {
@@ -381,7 +535,11 @@ pub fn system() -> Option<SharedTrustStore> {
     {
         Some(Arc::new(HelperTrust(super::privileged::system_socket())))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        Some(Arc::new(UserStore::root()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         None
     }

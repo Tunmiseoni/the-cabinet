@@ -1,5 +1,5 @@
 use crate::anchors::Anchors;
-use crate::firewall::{AppFirewall, PortFirewall, Programs};
+use crate::firewall::{AppFirewall, PortFirewall, Programs, RuleFirewall};
 use crate::hosts;
 use crate::journal::Journal;
 use crate::lowports::PortGrant;
@@ -55,6 +55,11 @@ impl Engine {
         Ok((programs, firewall))
     }
 
+    fn rule_firewall(&self) -> Option<(&Programs, &dyn RuleFirewall)> {
+        let programs = self.programs.as_ref()?;
+        Some((programs, programs.rule_firewall.as_deref()?))
+    }
+
     fn port_firewall(&self) -> Option<(&Programs, &dyn PortFirewall)> {
         let programs = self.programs.as_ref()?;
         Some((programs, programs.port_firewall.as_deref()?))
@@ -101,6 +106,15 @@ impl Engine {
         menu::check(owner, scope, &change)?;
         let mut act = false;
         let change = match change {
+            Change::Firewall { program, ports, .. } if self.rule_firewall().is_some() => {
+                let (programs, _) = self.rule_firewall().expect("checked above");
+                Change::Firewall {
+                    program: programs.resolve(&program)?,
+                    ports,
+                    keep: false,
+                    opened: Vec::new(),
+                }
+            }
             Change::Firewall { program, ports, .. } if self.port_firewall().is_some() => {
                 let (programs, firewall) = self.port_firewall().expect("checked above");
                 let program = programs.resolve(&program)?;
@@ -232,6 +246,10 @@ impl Engine {
             Change::Hosts { names, target } => {
                 self.rewrite_hosts(|text| hosts::add(text, &entry.id, names, *target))
             }
+            Change::Firewall { program, ports, .. } if self.rule_firewall().is_some() => {
+                let (_, firewall) = self.rule_firewall().expect("checked above");
+                firewall.add(&crate::firewall::rule_name(&entry.id), program, ports)
+            }
             Change::Firewall { opened, .. } if !opened.is_empty() => self.open_ports(opened),
             Change::Firewall { program, .. } if act => self
                 .firewall()
@@ -320,6 +338,10 @@ impl Engine {
         };
         match &entry.change {
             Change::Hosts { .. } => self.rewrite_hosts(|text| hosts::remove(text, &entry.id))?,
+            Change::Firewall { .. } if self.rule_firewall().is_some() => {
+                let (_, firewall) = self.rule_firewall().expect("checked above");
+                firewall.remove(&crate::firewall::rule_name(&entry.id))?
+            }
             Change::Firewall { opened, .. } if !opened.is_empty() => {
                 self.close_ports(&entry.id, opened)?
             }
@@ -416,18 +438,81 @@ pub(crate) mod tests {
 
     pub(crate) struct Scratch(pub PathBuf);
 
-    #[cfg(unix)]
     pub(crate) fn program(scratch: &Scratch) -> String {
         let files = scratch.0.join("store").join("cd".repeat(32)).join("files");
         std::fs::create_dir_all(&files).unwrap();
         let program = files.join("echo-cart");
         std::fs::write(&program, "x").unwrap();
-        program
-            .canonicalize()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string()
+        crate::firewall::path_text(&program.canonicalize().unwrap()).unwrap()
+    }
+
+    fn with_rules(scratch: &Scratch, fake: &crate::firewall::tests::FakeRules) -> Engine {
+        scratch.engine().with_programs(Some(Programs {
+            firewall: None,
+            port_firewall: None,
+            rule_firewall: Some(Box::new(fake.clone())),
+            low_ports: None,
+            root: scratch.0.clone(),
+            uid: None,
+        }))
+    }
+
+    #[test]
+    fn each_firewall_entry_gets_its_own_rule_and_takes_only_that_away() {
+        use crate::protocol::{Port, Proto};
+        let scratch = Scratch::new("rules");
+        let fake = crate::firewall::tests::FakeRules::default();
+        let program = program(&scratch);
+        let mut engine = with_rules(&scratch, &fake);
+        let ports = vec![Port {
+            proto: Proto::Tcp,
+            port: 987,
+        }];
+        let change = Change::Firewall {
+            program: program.clone(),
+            ports: ports.clone(),
+            keep: false,
+            opened: Vec::new(),
+        };
+        let first = engine.apply(OWNER, Scope::Session, change.clone()).unwrap();
+        let second = engine.apply(OWNER, Scope::Session, change.clone()).unwrap();
+        assert_eq!(
+            *fake.rules.lock().unwrap(),
+            vec![
+                (
+                    format!("The Cabinet {}", first.id),
+                    program.clone(),
+                    ports.clone()
+                ),
+                (
+                    format!("The Cabinet {}", second.id),
+                    program.clone(),
+                    ports.clone()
+                ),
+            ]
+        );
+        engine.undo(&first.id).unwrap();
+        assert_eq!(fake.rules.lock().unwrap().len(), 1);
+        assert_eq!(
+            fake.rules.lock().unwrap()[0].0,
+            format!("The Cabinet {}", second.id)
+        );
+        let (undone, failures) = engine.sweep(|_| false);
+        assert_eq!((undone, failures.len()), (1, 0));
+        assert!(fake.rules.lock().unwrap().is_empty());
+
+        *fake.refuse.lock().unwrap() = true;
+        engine.apply(OWNER, Scope::Session, change).unwrap_err();
+        assert!(engine.entries().is_empty());
+        let outside = Change::Firewall {
+            program: crate::firewall::path_text(&scratch.hosts().canonicalize().unwrap()).unwrap(),
+            ports: Vec::new(),
+            keep: false,
+            opened: Vec::new(),
+        };
+        *fake.refuse.lock().unwrap() = false;
+        engine.apply(OWNER, Scope::Session, outside).unwrap_err();
+        assert!(fake.rules.lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]
@@ -445,6 +530,7 @@ pub(crate) mod tests {
         scratch.engine().with_programs(Some(Programs {
             firewall: Some(Box::new(fake.clone())),
             port_firewall: None,
+            rule_firewall: None,
             low_ports: None,
             root: scratch.0.clone(),
             uid: None,
@@ -523,6 +609,7 @@ pub(crate) mod tests {
             scratch.engine().with_programs(Some(Programs {
                 firewall: None,
                 port_firewall: Some(Box::new(fake.clone())),
+                rule_firewall: None,
                 low_ports: None,
                 root: scratch.0.clone(),
                 uid: None,
@@ -639,6 +726,7 @@ pub(crate) mod tests {
         let mut engine = scratch.engine().with_programs(Some(Programs {
             firewall: None,
             port_firewall: None,
+            rule_firewall: None,
             low_ports: Some(Box::new(grant.clone())),
             root: scratch.0.clone(),
             uid: None,
@@ -659,6 +747,7 @@ pub(crate) mod tests {
         let mut engine = scratch.engine().with_programs(Some(Programs {
             firewall: None,
             port_firewall: None,
+            rule_firewall: None,
             low_ports: Some(Box::new(grant.clone())),
             root: scratch.0.clone(),
             uid: None,

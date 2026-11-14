@@ -39,7 +39,7 @@ pub fn pem(der: &[u8]) -> String {
     text
 }
 
-fn der(bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub fn der(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if !bytes.starts_with(b"-----") {
         return Ok(bytes.to_vec());
     }

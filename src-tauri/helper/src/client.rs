@@ -2,7 +2,7 @@ use crate::protocol::{self, Change, Entry, Request, Response, Scope, MAX_LINE};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::time::Duration;
 
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Client {
@@ -27,6 +27,51 @@ impl Client {
             .and_then(|()| stream.set_write_timeout(Some(TIMEOUT)))
             .and_then(|()| stream.try_clone());
         let writer = prepared.map_err(|err| format!("cannot talk to the helper: {err}"))?;
+        Ok(Self::over(Box::new(stream), Box::new(writer)))
+    }
+
+    #[cfg(windows)]
+    pub fn connect(pipe: &std::path::Path) -> Result<Self, String> {
+        Self::connect_checked(pipe, |_| Ok(()))
+    }
+
+    #[cfg(windows)]
+    pub fn connect_checked(
+        pipe: &std::path::Path,
+        check: impl Fn(u32) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+        use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+        use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let stream = loop {
+            let opened = std::fs::OpenOptions::new()
+                .access_mode(crate::server::CLIENT_ACCESS)
+                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .open(pipe);
+            match opened {
+                Ok(stream) => break stream,
+                Err(err)
+                    if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => return Err(format!("cannot reach the helper: {err}")),
+            }
+        };
+        let mut server = 0;
+        if unsafe { GetNamedPipeServerProcessId(stream.as_raw_handle(), &mut server) } == 0 {
+            return Err(crate::win::last_error(
+                "cannot tell which program answers the helper's pipe",
+            ));
+        }
+        check(server)?;
+        let writer = stream
+            .try_clone()
+            .map_err(|err| format!("cannot talk to the helper: {err}"))?;
         Ok(Self::over(Box::new(stream), Box::new(writer)))
     }
 
@@ -105,7 +150,7 @@ impl Client {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
     use crate::engine::tests::{hosts, Scratch, BASE, NAME, OWNER};
@@ -114,8 +159,21 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
+    #[cfg(unix)]
+    fn endpoint(scratch: &Scratch) -> PathBuf {
+        scratch.0.join("helper.sock")
+    }
+
+    #[cfg(windows)]
+    fn endpoint(scratch: &Scratch) -> PathBuf {
+        PathBuf::from(format!(
+            r"\\.\pipe\{}",
+            scratch.0.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
     fn serve(scratch: &Scratch) -> PathBuf {
-        let socket = scratch.0.join("helper.sock");
+        let socket = endpoint(scratch);
         let server = Server::bind(Config {
             endpoint: socket.clone(),
             state_dir: scratch.0.clone(),
@@ -230,6 +288,72 @@ mod tests {
         let mut line = String::new();
         client.reader.read_line(&mut line).unwrap();
         assert!(line.contains("\"error\""), "{line}");
+        assert_eq!(client.hello().unwrap(), protocol::VERSION);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_pipe_admits_only_system_and_its_user() {
+        let scratch = Scratch::new("pipe-acl");
+        let pipe = serve(&scratch);
+        let me = crate::win::current_user().unwrap();
+        let client = Client::connect(&pipe).unwrap();
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match std::fs::OpenOptions::new().read(true).open(&pipe) {
+                Ok(stream) => break stream,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("cannot open {}: {err}", pipe.display()),
+            }
+        };
+        let access = crate::win::access_of(&stream).unwrap();
+        let expected = crate::win::Descriptor::parse(&format!(
+            "D:P(A;;FA;;;SY)(A;;FA;;;{me})(A;;0x12008b;;;{me})"
+        ))
+        .unwrap()
+        .access()
+        .unwrap();
+        assert_eq!(access, expected);
+        assert_eq!(
+            crate::server::access_list(crate::win::SYSTEM, &me),
+            format!("D:P(A;;FA;;;S-1-5-18)(A;;0x12008b;;;{me})")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_second_server_cannot_take_the_pipe_and_a_wrong_server_is_refused() {
+        let scratch = Scratch::new("pipe-squat");
+        let pipe = serve(&scratch);
+        let other = Scratch::new("pipe-squat-other");
+        let squatter = Server::bind(Config {
+            endpoint: pipe.clone(),
+            state_dir: other.0.clone(),
+            hosts: other.hosts(),
+            user: None,
+            flush: false,
+            programs: None,
+            anchors: None,
+        });
+        assert!(squatter.is_err());
+        let me = std::process::id();
+        let err = Client::connect_checked(&pipe, |server| {
+            Err(format!("the pipe belongs to process {server}"))
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err, format!("the pipe belongs to process {me}"));
+        let mut client = Client::connect_checked(&pipe, |server| {
+            if server == me {
+                Ok(())
+            } else {
+                Err("wrong server".to_string())
+            }
+        })
+        .unwrap();
         assert_eq!(client.hello().unwrap(), protocol::VERSION);
     }
 }

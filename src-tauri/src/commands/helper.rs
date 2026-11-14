@@ -166,7 +166,103 @@ mod system {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+mod system {
+    use super::HelperStatus;
+    use crate::cartridge::privileged;
+    use cabinet_helper::protocol::VERSION;
+    use cabinet_helper::win;
+    use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, WaitForSingleObject, INFINITE,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+
+    const BUNDLED: &str = "cabinet-helper.exe";
+
+    pub fn status() -> HelperStatus {
+        let helper = privileged::ServiceHelper;
+        let installed = !helper.absent();
+        let entries = if installed {
+            helper.connect().and_then(|mut client| client.status())
+        } else {
+            Ok(Vec::new())
+        };
+        HelperStatus {
+            supported: true,
+            installed,
+            ready: installed && entries.is_ok(),
+            expected_version: VERSION,
+            error: entries.as_ref().err().cloned(),
+            entries: entries.unwrap_or_default(),
+        }
+    }
+
+    fn bundled() -> crate::error::Result<PathBuf> {
+        let exe = std::env::current_exe()?;
+        let path = exe.with_file_name(BUNDLED);
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!(
+                "the helper program is missing from this build ({})",
+                path.display()
+            )
+            .into())
+        }
+    }
+
+    fn as_admin(program: &Path, args: &str) -> crate::error::Result<()> {
+        let verb = win::wide("runas");
+        let file = win::wide(program);
+        let parameters = win::wide(args);
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            lpVerb: verb.as_ptr(),
+            lpFile: file.as_ptr(),
+            lpParameters: parameters.as_ptr(),
+            nShow: 0,
+            ..Default::default()
+        };
+        if unsafe { ShellExecuteExW(&mut info) } == 0 {
+            if unsafe { GetLastError() } == ERROR_CANCELLED {
+                return Err("the administrator prompt was cancelled".into());
+            }
+            return Err(win::last_error("cannot start the helper as an administrator").into());
+        }
+        if info.hProcess.is_null() {
+            return Err("the helper did not start as an administrator".into());
+        }
+        let mut code = 1;
+        unsafe {
+            WaitForSingleObject(info.hProcess, INFINITE);
+            GetExitCodeProcess(info.hProcess, &mut code);
+            CloseHandle(info.hProcess);
+        }
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(format!("the helper could not be changed (exit code {code})").into())
+        }
+    }
+
+    pub fn install() -> crate::error::Result<()> {
+        log::info!("The Cabinet wants to install its helper, which makes the system changes a cartridge was approved for and undoes them afterwards.");
+        let user = win::current_user()?;
+        as_admin(&bundled()?, &format!("install --sid {user}"))
+    }
+
+    pub fn uninstall() -> crate::error::Result<()> {
+        log::info!("The Cabinet wants to remove its helper and undo every change it still holds.");
+        as_admin(&bundled()?, "uninstall")
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod system {
     use super::HelperStatus;
 
