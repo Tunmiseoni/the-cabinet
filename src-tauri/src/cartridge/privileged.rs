@@ -291,28 +291,77 @@ impl SocketHelper {
     }
 
     pub fn connect(&self) -> Result<cabinet_helper::client::Client, String> {
-        let mut client = cabinet_helper::client::Client::connect(&self.socket).map_err(|err| {
+        let client = cabinet_helper::client::Client::connect(&self.socket).map_err(|err| {
             if self.absent() {
                 "The Cabinet's helper is not installed. Install it first; it asks for an administrator password once.".to_string()
             } else {
                 format!("The Cabinet's helper is not answering: {err}")
             }
         })?;
-        let version = client.hello()?;
-        if version != cabinet_helper::protocol::VERSION {
-            return Err(format!(
-                "The Cabinet's helper is out of date (version {version}, this app needs {}). Install it again.",
-                cabinet_helper::protocol::VERSION
-            ));
-        }
-        Ok(client)
+        current(client)
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn current(
+    mut client: cabinet_helper::client::Client,
+) -> Result<cabinet_helper::client::Client, String> {
+    let version = client.hello()?;
+    if version != cabinet_helper::protocol::VERSION {
+        return Err(format!(
+            "The Cabinet's helper is out of date (version {version}, this app needs {}). Install it again.",
+            cabinet_helper::protocol::VERSION
+        ));
+    }
+    Ok(client)
+}
+
+#[cfg(windows)]
+pub struct ServiceHelper;
+
+#[cfg(windows)]
+impl ServiceHelper {
+    pub fn absent(&self) -> bool {
+        !cabinet_helper::system::is_installed()
+    }
+
+    pub fn connect(&self) -> Result<cabinet_helper::client::Client, String> {
+        let client = cabinet_helper::system::connect().map_err(|err| {
+            if self.absent() {
+                "The Cabinet's helper is not installed. Install it first; Windows asks for an administrator's approval once.".to_string()
+            } else {
+                format!("The Cabinet's helper is not answering: {err}")
+            }
+        })?;
+        current(client)
+    }
+}
+
+#[cfg(windows)]
+impl Helper for ServiceHelper {
+    fn lease(&self) -> Result<Box<dyn Lease>, String> {
+        Ok(Box::new(SocketLease(self.connect()?)))
+    }
+
+    fn forget(&self, owner: &str) -> Result<usize, String> {
+        if self.absent() {
+            return Ok(0);
+        }
+        self.connect()?.forget(owner)
+    }
+
+    fn sweep(&self) -> Result<usize, String> {
+        if self.absent() {
+            return Ok(0);
+        }
+        self.connect()?.sweep()
+    }
+}
+
+#[cfg(any(unix, windows))]
 struct SocketLease(cabinet_helper::client::Client);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Lease for SocketLease {
     fn apply(&mut self, owner: &str, change: &Change) -> Result<(), String> {
         self.0

@@ -8,12 +8,37 @@ pub mod lowports;
 pub mod menu;
 pub mod protocol;
 pub mod server;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod system;
+#[cfg(windows)]
+pub mod win;
 
 use std::io::Write;
 
 struct StderrLog;
+
+#[cfg(windows)]
+static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+const MAX_LOG: u64 = 1024 * 1024;
+
+#[cfg(windows)]
+pub(crate) fn log_to(path: &std::path::Path) {
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_LOG) {
+        let _ = std::fs::remove_file(path);
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => {
+            let _ = LOG_FILE.set(std::sync::Mutex::new(file));
+        }
+        Err(err) => log::warn!("cannot log to {}: {err}", path.display()),
+    }
+}
 
 impl log::Log for StderrLog {
     fn enabled(&self, _: &log::Metadata<'_>) -> bool {
@@ -24,19 +49,25 @@ impl log::Log for StderrLog {
         let seconds = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        let _ = writeln!(
-            std::io::stderr(),
-            "{seconds} {} {}",
-            record.level(),
-            record.args()
-        );
+        let line = format!("{seconds} {} {}\n", record.level(), record.args());
+        #[cfg(windows)]
+        if let Some(file) = LOG_FILE.get() {
+            let mut file = file.lock().unwrap_or_else(|err| err.into_inner());
+            let _ = file.write_all(line.as_bytes());
+            return;
+        }
+        let _ = std::io::stderr().write_all(line.as_bytes());
     }
 
     fn flush(&self) {}
 }
 
+#[cfg(not(windows))]
 const USAGE: &str =
     "usage: cabinet-helper daemon --uid <uid> | install --uid <uid> | uninstall | version";
+#[cfg(windows)]
+const USAGE: &str =
+    "usage: cabinet-helper daemon --sid <sid> | install --sid <sid> | uninstall | version";
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn dispatch(args: &[&str]) -> Result<(), String> {
@@ -53,7 +84,17 @@ fn dispatch(args: &[&str]) -> Result<(), String> {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn dispatch(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["daemon", "--sid", sid] => system::daemon(sid),
+        ["install", "--sid", sid] => system::install(sid),
+        ["uninstall"] => system::uninstall(),
+        _ => Err(USAGE.to_string()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn dispatch(args: &[&str]) -> Result<(), String> {
     match args {
         ["daemon", ..] | ["install", ..] | ["uninstall"] => {

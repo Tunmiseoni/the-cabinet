@@ -1,4 +1,4 @@
-#![cfg_attr(not(unix), allow(dead_code))]
+#![cfg_attr(not(any(unix, windows)), allow(dead_code))]
 
 use crate::engine::Engine;
 use crate::protocol::{self, Request, Response, Scope, MAX_LINE, VERSION};
@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 mod unix;
 #[cfg(unix)]
 pub use unix::Server;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{access_list, Server, CLIENT_ACCESS};
 
 const MAX_CONNECTIONS: usize = 32;
 

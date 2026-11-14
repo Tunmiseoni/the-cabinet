@@ -105,6 +105,28 @@ jobs:
           test ! -e /var/lib/com.the-cabinet.helper
           test ! -e /run/com.the-cabinet.helper.sock
 
+      - name: Prove the installed helper (Windows)
+        if: matrix.os == 'windows-latest'
+        working-directory: src-tauri
+        shell: pwsh
+        run: |
+          function Run { & $args[0] $args[1..($args.Length - 1)]; if ($LASTEXITCODE -ne 0) { throw "$($args -join ' ') failed with $LASTEXITCODE" } }
+          Run cargo build --bin cabinet-helper
+          $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
+          $before = (Get-FileHash $hosts).Hash
+          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          Run target\debug\cabinet-helper.exe install --sid $sid
+          Run target\debug\cabinet-helper.exe install --sid $sid
+          if ((Get-Service com.the-cabinet.helper).Status -ne 'Running') { throw "the service is not running" }
+          Get-CimInstance Win32_Service -Filter "Name='com.the-cabinet.helper'" | Format-List Name, StartName, StartMode, PathName
+          Run cargo test --workspace -- --ignored --test-threads=1 the_installed_helper_
+          Run target\debug\cabinet-helper.exe uninstall
+          if (Get-Service com.the-cabinet.helper -ErrorAction SilentlyContinue) { throw "the service is still there" }
+          if (Test-Path "$env:ProgramFiles\The Cabinet Helper") { throw "the program folder is still there" }
+          if (Test-Path "$env:ProgramData\com.the-cabinet.helper") { throw "the journal folder is still there" }
+          if ([System.IO.Directory]::GetFiles("\\.\pipe\") -contains "\\.\pipe\com.the-cabinet.helper") { throw "the pipe is still there" }
+          if ((Get-FileHash $hosts).Hash -ne $before) { throw "the hosts file changed" }
+
       - name: Build echo-cart
         working-directory: src-tauri
         run: cargo build --release -p echo-cart
