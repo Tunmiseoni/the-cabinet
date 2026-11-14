@@ -53,16 +53,25 @@ pub fn remove(text: &str, id: &str) -> String {
         .collect()
 }
 
+fn line_end(text: &str) -> &'static str {
+    if text.contains("\r\n") || (text.is_empty() && cfg!(windows)) {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
 pub fn add(text: &str, id: &str, names: &[String], target: Ipv4Addr) -> String {
+    let end = line_end(text);
     let mut out = remove(text, id);
     if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+        out.push_str(end);
     }
-    out.push_str(&format!("{OPEN}{id}\n"));
+    out.push_str(&format!("{OPEN}{id}{end}"));
     for name in names {
-        out.push_str(&format!("{target} {name}\n"));
+        out.push_str(&format!("{target} {name}{end}"));
     }
-    out.push_str(&format!("{CLOSE}{id}\n"));
+    out.push_str(&format!("{CLOSE}{id}{end}"));
     out
 }
 
@@ -116,6 +125,23 @@ pub fn write(path: &Path, text: &str) -> Result<(), String> {
 }
 
 pub fn flush_cache() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let ipconfig = crate::win::windows_dir()
+            .map(|dir| dir.join(r"System32\ipconfig.exe"))
+            .unwrap_or_else(|_| r"C:\Windows\System32\ipconfig.exe".into());
+        match std::process::Command::new(&ipconfig)
+            .arg("/flushdns")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => log::warn!("{} exited with {}", ipconfig.display(), output.status),
+            Err(err) => log::warn!("cannot run {}: {err}", ipconfig.display()),
+        }
+    }
     #[cfg(target_os = "macos")]
     for (program, args) in [
         ("/usr/bin/dscacheutil", &["-flushcache"][..]),
@@ -201,6 +227,21 @@ mod tests {
         let text = "127.0.0.1 localhost\r\n# mine\r\n";
         let added = add(text, "1", &names(&["a.invalid"]), Ipv4Addr::LOCALHOST);
         assert_eq!(remove(&added, "1"), text);
+    }
+
+    #[test]
+    fn writes_its_block_with_the_line_endings_of_the_file() {
+        let text = "127.0.0.1 localhost\r\n# mine";
+        let added = add(text, "1", &names(&["a.invalid"]), Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            added,
+            "127.0.0.1 localhost\r\n# mine\r\n# >>> the-cabinet 1\r\n127.0.0.1 a.invalid\r\n# <<< the-cabinet 1\r\n"
+        );
+        assert_eq!(ids(&added), vec!["1"]);
+        assert_eq!(outside(&added).len(), 1);
+        assert_eq!(remove(&added, "1"), "127.0.0.1 localhost\r\n# mine\r\n");
+        let empty = add("", "2", &names(&["a.invalid"]), Ipv4Addr::LOCALHOST);
+        assert_eq!(empty.contains("\r\n"), cfg!(windows));
     }
 
     #[test]

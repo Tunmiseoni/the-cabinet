@@ -408,7 +408,11 @@ pub fn system() -> Option<SharedHelper> {
     {
         Some(Arc::new(system_socket()))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        Some(Arc::new(ServiceHelper))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         None
     }

@@ -563,4 +563,67 @@ mod tests {
         assert!(Client::connect_checked(Path::new(PIPE), |_| Err("refused".to_string())).is_err());
         assert_eq!(client.hello().unwrap(), crate::protocol::VERSION);
     }
+
+    #[test]
+    #[ignore = "needs The Cabinet's helper installed as a service on this machine; it edits the hosts file"]
+    fn the_installed_helper_redirects_the_test_name_while_a_caller_holds_it() {
+        use crate::protocol::{Change, Scope};
+        use std::net::{Ipv4Addr, ToSocketAddrs};
+        const OWNER: &str = "0123456789abcdef/test";
+        let redirect = |names: &[&str]| Change::Hosts {
+            names: names.iter().map(|name| name.to_string()).collect(),
+            target: Ipv4Addr::LOCALHOST,
+        };
+        let path = hosts().unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let resolves = || {
+            ("cabinet-test.invalid", 0)
+                .to_socket_addrs()
+                .map(|mut found| found.any(|address| address.ip() == Ipv4Addr::LOCALHOST))
+                .unwrap_or(false)
+        };
+        let eventually = |what: &str, check: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !check() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        assert!(!resolves(), "the test name resolves before the session");
+
+        let mut client = connect().unwrap();
+        client
+            .apply(OWNER, Scope::Session, &redirect(&["cabinet-test.invalid"]))
+            .unwrap();
+        let during = std::fs::read_to_string(&path).unwrap();
+        let end = if before.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        assert!(
+            during.contains(&format!("{end}127.0.0.1 cabinet-test.invalid{end}")),
+            "{during:?}"
+        );
+        eventually("the test name to resolve", &resolves);
+        for refused in [&["api.example-game.net"][..], &["localhost"][..]] {
+            client
+                .apply(OWNER, Scope::Session, &redirect(refused))
+                .unwrap_err();
+        }
+        assert_eq!(client.release().unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        eventually("the test name to stop resolving", &|| !resolves());
+
+        let mut crashed = connect().unwrap();
+        crashed
+            .apply(OWNER, Scope::Session, &redirect(&["cabinet-test.invalid"]))
+            .unwrap();
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), before);
+        drop(crashed);
+        eventually("a crashed caller's redirect to be undone", &|| {
+            std::fs::read_to_string(&path).unwrap() == before
+        });
+        assert!(client.status().unwrap().is_empty());
+    }
 }
