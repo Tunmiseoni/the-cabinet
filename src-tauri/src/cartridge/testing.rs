@@ -18,7 +18,7 @@ impl Scratch {
         Self(dir)
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(crate) fn at(dir: PathBuf) -> Self {
         let _ = archive::remove_tree(&dir);
         std::fs::create_dir_all(&dir).unwrap();

@@ -282,13 +282,13 @@ impl Privileges {
     }
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(any(unix, all(windows, test)))]
 pub struct SocketHelper {
     pub socket: std::path::PathBuf,
     pub installed: Option<std::path::PathBuf>,
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(any(unix, all(windows, test)))]
 impl SocketHelper {
     pub fn absent(&self) -> bool {
         self.installed.as_ref().is_some_and(|path| !path.exists())
@@ -378,7 +378,7 @@ impl Lease for SocketLease {
     }
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(any(unix, all(windows, test)))]
 impl Helper for SocketHelper {
     fn lease(&self) -> Result<Box<dyn Lease>, String> {
         Ok(Box::new(SocketLease(self.connect()?)))
