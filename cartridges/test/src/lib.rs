@@ -12,6 +12,16 @@ pub fn run(args: &[String], input: impl BufRead, output: impl Write) -> i32 {
     match args.first().map(String::as_str) {
         Some("setup") => return setup(args.get(1)),
         Some("uninstall") => return 0,
+        Some("bind") => {
+            return match args
+                .get(1)
+                .and_then(|port| port.parse().ok())
+                .map(bind_only)
+            {
+                Some(Ok(_)) => 0,
+                _ => 14,
+            }
+        }
         _ => {}
     }
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
