@@ -119,7 +119,7 @@ jobs:
           Run target\debug\cabinet-helper.exe install --sid $sid
           if ((Get-Service com.the-cabinet.helper).Status -ne 'Running') { throw "the service is not running" }
           Get-CimInstance Win32_Service -Filter "Name='com.the-cabinet.helper'" | Format-List Name, StartName, StartMode, PathName
-          Run cargo test --workspace -- --ignored --test-threads=1 the_installed_helper_
+          Run cargo test --workspace '--' --ignored --test-threads=1 the_installed_helper_
           Run target\debug\cabinet-helper.exe uninstall
           if (Get-Service com.the-cabinet.helper -ErrorAction SilentlyContinue) { throw "the service is still there" }
           if (Test-Path "$env:ProgramFiles\The Cabinet Helper") { throw "the program folder is still there" }
