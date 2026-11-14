@@ -561,6 +561,7 @@ impl FakeSystem {
                     Box::new(system.ports.clone())
                         as Box<dyn cabinet_helper::firewall::PortFirewall>
                 }),
+                rule_firewall: None,
                 low_ports: Some(Box::new(system.low_ports.clone())),
                 root: scratch.path("app"),
                 uid: None,

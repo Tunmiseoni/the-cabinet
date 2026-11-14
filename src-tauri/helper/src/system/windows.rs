@@ -166,6 +166,24 @@ fn secure_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn programs(user: &str) -> crate::firewall::Programs {
+    let root = match win::profile(user) {
+        Some(profile) => profile.join(APP_DATA),
+        None => {
+            log::warn!("{user} has no profile folder; no program can be allowed");
+            PathBuf::new()
+        }
+    };
+    crate::firewall::Programs {
+        firewall: None,
+        port_firewall: None,
+        rule_firewall: Some(Box::new(crate::firewall::Netsh)),
+        low_ports: None,
+        root,
+        uid: Some(user.to_string()),
+    }
+}
+
 fn bind(user: &str) -> Result<Server, String> {
     let state_dir = state_dir()?;
     secure_dir(&state_dir)?;
@@ -176,7 +194,7 @@ fn bind(user: &str) -> Result<Server, String> {
         hosts: hosts()?,
         user: Some(user.to_string()),
         flush: true,
-        programs: None,
+        programs: Some(programs(user)),
         anchors: None,
     })
 }
@@ -468,7 +486,9 @@ pub fn uninstall() -> Result<(), String> {
     let state_dir = state_dir()?;
     let mut problems = Vec::new();
     if state_dir.exists() {
-        match Engine::open(&state_dir, &hosts()?, true) {
+        match Engine::open(&state_dir, &hosts()?, true)
+            .map(|engine| engine.with_programs(Some(programs(win::SYSTEM))))
+        {
             Ok(mut engine) => {
                 let (_, failures) = engine.undo_where(|_| true);
                 problems.extend(failures);
@@ -625,5 +645,82 @@ mod tests {
             std::fs::read_to_string(&path).unwrap() == before
         });
         assert!(client.status().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs The Cabinet's helper installed as a service on this machine; it adds firewall rules"]
+    fn the_installed_helper_allows_a_cartridge_program_while_a_caller_holds_it() {
+        use crate::firewall::{rule_name, Netsh};
+        use crate::protocol::{Change, Port, Proto, Scope};
+        const OWNER: &str = "0123456789abcdef/test";
+        let me = win::current_user().unwrap();
+        let files = win::profile(&me)
+            .unwrap()
+            .join(APP_DATA)
+            .join(format!("live-test-{}", std::process::id()))
+            .join("store")
+            .join("cd".repeat(32))
+            .join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let program = files.join("echo-cart.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
+        win::set_owner(&program, &me).unwrap();
+        let allow = |program: &str, ports: Vec<Port>| Change::Firewall {
+            program: program.to_string(),
+            ports,
+            keep: false,
+            opened: Vec::new(),
+        };
+        let ports = vec![
+            Port {
+                proto: Proto::Tcp,
+                port: 987,
+            },
+            Port {
+                proto: Proto::Udp,
+                port: 3074,
+            },
+        ];
+        let shown = |id: &str| Netsh::exists(&rule_name(id)).unwrap();
+        let eventually = |what: &str, check: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !check() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+
+        let mut client = connect().unwrap();
+        let text = program.to_str().unwrap().to_string();
+        let first = client
+            .apply(OWNER, Scope::Session, &allow(&text, ports.clone()))
+            .unwrap();
+        let second = client
+            .apply(OWNER, Scope::Session, &allow(&text, Vec::new()))
+            .unwrap();
+        assert!(shown(&first) && shown(&second));
+        let held = client.status().unwrap();
+        assert!(
+            held.iter().all(|entry| matches!(&entry.change,
+            Change::Firewall { program, .. } if !program.starts_with(r"\\?\"))),
+            "{held:?}"
+        );
+        for outsider in [r"C:\Windows\System32\cmd.exe", r"C:\Windows\notepad.exe"] {
+            client
+                .apply(OWNER, Scope::Session, &allow(outsider, Vec::new()))
+                .unwrap_err();
+        }
+        assert_eq!(client.release().unwrap(), 2);
+        assert!(!shown(&first) && !shown(&second));
+
+        let mut crashed = connect().unwrap();
+        let left = crashed
+            .apply(OWNER, Scope::Session, &allow(&text, ports))
+            .unwrap();
+        assert!(shown(&left));
+        drop(crashed);
+        eventually("a crashed caller's rule to be removed", &|| !shown(&left));
+        assert!(client.status().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(files.ancestors().nth(3).unwrap());
     }
 }

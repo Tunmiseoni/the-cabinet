@@ -123,12 +123,13 @@ fn unsupported(capabilities: &Capabilities) -> Vec<&'static str> {
             });
         }
     }
-    let firewall_on_linux = cfg!(target_os = "linux")
+    let firewall_through_helper = cfg!(any(target_os = "linux", windows))
         && capabilities
             .firewall
             .as_ref()
             .is_some_and(|firewall| firewall.scope == ManifestScope::Session);
-    if capabilities.firewall.is_some() && !settled.contains(&"firewall") && !firewall_on_linux {
+    if capabilities.firewall.is_some() && !settled.contains(&"firewall") && !firewall_through_helper
+    {
         items.push("firewall");
     }
     items

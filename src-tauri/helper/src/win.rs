@@ -7,7 +7,8 @@ use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
-    GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
@@ -163,6 +164,32 @@ pub fn owner_of(path: &Path) -> Result<String, String> {
     }
     let _free = Local(descriptor);
     unsafe { sid_text(owner) }
+}
+
+pub fn set_owner(path: &Path, sid: &str) -> Result<(), String> {
+    let mut owner: PSID = std::ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(wide(sid).as_ptr(), &mut owner) } == 0 {
+        return Err(format!("\"{sid}\" is not a security identifier"));
+    }
+    let _free = Local(owner);
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            owner,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(error(
+            &format!("cannot hand {} to {sid}", path.display()),
+            status,
+        ));
+    }
+    Ok(())
 }
 
 pub fn access_of(handle: &impl AsRawHandle) -> Result<String, String> {
