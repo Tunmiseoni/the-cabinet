@@ -734,16 +734,23 @@ pub(crate) mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn low_ports_are_not_built_off_macos() {
+    fn low_ports_need_no_change_on_windows() {
         let capabilities = Capabilities {
             low_ports: vec![443],
             ..hosts()
         };
-        let helper: SharedHelper = Arc::new(FakeHelper::default());
-        let err = privileges(Some(helper), &capabilities, Grant::Granted)
-            .check()
-            .unwrap_err();
-        assert!(err.contains("low_ports"), "{err}");
+        let helper = Arc::new(FakeHelper::default());
+        let applied = Arc::clone(&helper.applied);
+        let mut privileges = privileges(Some(helper), &capabilities, Grant::Granted)
+            .with_service_program(Some(r"C:\store\service.exe".to_string()));
+        privileges.check().unwrap();
+        privileges.apply("127.0.0.1").unwrap();
+        assert!(applied
+            .lock_or_recover()
+            .iter()
+            .all(|(_, change)| !matches!(change, Change::LowPorts { .. })));
+        assert_eq!(applied.lock_or_recover().len(), 1);
+        privileges.release();
     }
 
     #[test]

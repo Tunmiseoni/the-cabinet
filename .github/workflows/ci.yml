@@ -112,6 +112,18 @@ jobs:
         run: |
           function Run { & $args[0] $args[1..($args.Length - 1)]; if ($LASTEXITCODE -ne 0) { throw "$($args -join ' ') failed with $LASTEXITCODE" } }
           Run cargo build --bin cabinet-helper
+          $password = "Cab-" + [guid]::NewGuid().ToString() + "-1a"
+          Run net user cabinet-standard $password /add
+          if (Get-LocalGroupMember Administrators | Where-Object Name -like '*\cabinet-standard') { throw "the test user is an administrator" }
+          $credential = [pscredential]::new('cabinet-standard', (ConvertTo-SecureString $password -AsPlainText -Force))
+          $public = Join-Path $env:PUBLIC cabinet-bind
+          New-Item -ItemType Directory -Force $public | Out-Null
+          Copy-Item target\debug\echo-cart.exe $public
+          $bind = Start-Process -FilePath (Join-Path $public echo-cart.exe) -ArgumentList 'bind', '989' -Credential $credential -WorkingDirectory $public -Wait -PassThru
+          Run net user cabinet-standard /delete
+          Remove-Item -Recurse -Force $public
+          if ($bind.ExitCode -ne 0) { throw "a standard user could not bind port 989 (exit code $($bind.ExitCode))" }
+          Write-Output "a standard user bound port 989"
           $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
           $before = (Get-FileHash $hosts).Hash
           $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value

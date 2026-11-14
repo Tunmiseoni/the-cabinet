@@ -1088,108 +1088,6 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
     assert_eq!(system.hosts(), before);
 }
 
-#[cfg(windows)]
-#[test]
-fn a_program_without_administrator_rights_may_bind_a_low_port_on_windows() {
-    use cabinet_helper::win;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Security::{
-        CheckTokenMembership, CreateRestrictedToken, DuplicateToken, SecurityImpersonation,
-        DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
-    };
-    use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
-        WaitForSingleObject, CREATE_NO_WINDOW, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
-    };
-    let mut token = std::ptr::null_mut();
-    let access = TOKEN_DUPLICATE
-        | TOKEN_ASSIGN_PRIMARY
-        | TOKEN_QUERY
-        | TOKEN_ADJUST_DEFAULT
-        | TOKEN_ADJUST_SESSIONID;
-    assert_ne!(
-        unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) },
-        0
-    );
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    let mut restricted = std::ptr::null_mut();
-    let made = win::with_sid(win::ADMINISTRATORS, |sid| unsafe {
-        let disabled = [SID_AND_ATTRIBUTES {
-            Sid: sid,
-            Attributes: 0,
-        }];
-        CreateRestrictedToken(
-            token.as_raw_handle(),
-            DISABLE_MAX_PRIVILEGE,
-            1,
-            disabled.as_ptr(),
-            0,
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            &mut restricted,
-        )
-    })
-    .unwrap();
-    assert_ne!(made, 0, "{}", win::last_error("cannot restrict the token"));
-    let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
-    let mut check = std::ptr::null_mut();
-    assert_ne!(
-        unsafe {
-            DuplicateToken(
-                restricted.as_raw_handle(),
-                SecurityImpersonation,
-                &mut check,
-            )
-        },
-        0
-    );
-    let check = unsafe { OwnedHandle::from_raw_handle(check) };
-    let mut member = 1;
-    win::with_sid(win::ADMINISTRATORS, |sid| unsafe {
-        CheckTokenMembership(check.as_raw_handle(), sid, &mut member)
-    })
-    .unwrap();
-    assert_eq!(
-        member, 0,
-        "the restricted token still has administrator rights"
-    );
-    let mut command = win::wide(format!("\"{}\" bind 989", echo_cart_binary().display()));
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    let mut process = PROCESS_INFORMATION::default();
-    let started = unsafe {
-        CreateProcessAsUserW(
-            restricted.as_raw_handle(),
-            std::ptr::null(),
-            command.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            CREATE_NO_WINDOW,
-            std::ptr::null(),
-            std::ptr::null(),
-            &startup,
-            &mut process,
-        )
-    };
-    assert_ne!(started, 0, "{}", win::last_error("cannot start echo-cart"));
-    let child = unsafe { OwnedHandle::from_raw_handle(process.hProcess) };
-    drop(unsafe { OwnedHandle::from_raw_handle(process.hThread) });
-    let mut code = 1;
-    unsafe {
-        WaitForSingleObject(child.as_raw_handle(), INFINITE);
-        GetExitCodeProcess(child.as_raw_handle(), &mut code);
-    }
-    assert_eq!(
-        code, 0,
-        "echo-cart without administrator rights could not bind port 989 (exit code {code:#x})"
-    );
-}
-
 const NEEDS_HOSTS: &str = "[lifecycle.service]\nprogram = \"main\"\n\n[capabilities.hosts]\nnames = [\"cabinet-test.invalid\"]\ntarget = \"service\"\nscope = \"session\"\n";
 
 #[test]
@@ -1336,7 +1234,9 @@ fn the_test_cartridge_runs_end_to_end_on_loopback() {
     #[cfg(windows)]
     {
         let rules = system.rules.0.lock_or_recover().clone();
-        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        assert_ne!(rules[0].0, rules[1].0, "{rules:?}");
+        assert_eq!(rules[0].1, rules[1].1, "{rules:?}");
         assert!(rules[0].0.starts_with("The Cabinet "), "{rules:?}");
         assert!(rules[0].1.ends_with(r"\echo-cart.exe"), "{rules:?}");
         assert!(!rules[0].1.starts_with(r"\\?\"), "{rules:?}");
