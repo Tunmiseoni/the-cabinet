@@ -94,6 +94,9 @@ fn settled(capabilities: &Capabilities) -> Vec<&'static str> {
             items.push("firewall");
         }
     }
+    if cfg!(windows) && !capabilities.low_ports.is_empty() {
+        items.push("low_ports");
+    }
     if cfg!(any(target_os = "linux", windows))
         && capabilities
             .trust_ca
@@ -279,13 +282,13 @@ impl Privileges {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct SocketHelper {
     pub socket: std::path::PathBuf,
     pub installed: Option<std::path::PathBuf>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl SocketHelper {
     pub fn absent(&self) -> bool {
         self.installed.as_ref().is_some_and(|path| !path.exists())
@@ -375,7 +378,7 @@ impl Lease for SocketLease {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Helper for SocketHelper {
     fn lease(&self) -> Result<Box<dyn Lease>, String> {
         Ok(Box::new(SocketLease(self.connect()?)))

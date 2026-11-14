@@ -74,6 +74,15 @@ pub fn check_sid(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn with_sid<T>(text: &str, work: impl FnOnce(PSID) -> T) -> Result<T, String> {
+    let mut sid: PSID = std::ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(wide(text).as_ptr(), &mut sid) } == 0 {
+        return Err(format!("\"{text}\" is not a security identifier"));
+    }
+    let _free = Local(sid);
+    Ok(work(sid))
+}
+
 pub fn current_user() -> Result<String, String> {
     let mut token: HANDLE = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
