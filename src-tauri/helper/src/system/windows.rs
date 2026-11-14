@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
     SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_QUERY_STATUS,
     SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP,
-    SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, FOLDERID_ProgramFiles};
 
@@ -204,7 +204,7 @@ fn report(state: u32, failure: u32) {
         },
         dwServiceSpecificExitCode: failure,
         dwCheckPoint: 0,
-        dwWaitHint: if state == SERVICE_START_PENDING {
+        dwWaitHint: if state == SERVICE_START_PENDING || state == SERVICE_STOP_PENDING {
             STARTUP.as_millis() as u32
         } else {
             0
@@ -217,8 +217,13 @@ unsafe extern "system" fn control(control: u32, _: u32, _: *mut c_void, _: *mut 
     match control {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
             log::info!("stopping");
-            report(SERVICE_STOPPED, 0);
-            std::process::exit(0);
+            report(SERVICE_STOP_PENDING, 0);
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                report(SERVICE_STOPPED, 0);
+                std::process::exit(0);
+            });
+            NO_ERROR
         }
         SERVICE_CONTROL_INTERROGATE => NO_ERROR,
         _ => ERROR_CALL_NOT_IMPLEMENTED,
@@ -280,19 +285,18 @@ pub fn daemon(user: &str) -> Result<(), String> {
 
 fn stop(service: &Handle) -> Result<(), String> {
     let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
-    if unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) } == 0 {
-        let code = unsafe { GetLastError() };
-        if code != ERROR_SERVICE_NOT_ACTIVE {
-            return Err(win::error(
-                &format!("cannot stop the {SERVICE} service"),
-                code,
-            ));
-        }
-    }
+    let refused = if unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) } == 0 {
+        Some(unsafe { GetLastError() }).filter(|code| *code != ERROR_SERVICE_NOT_ACTIVE)
+    } else {
+        None
+    };
     let deadline = Instant::now() + STOPPING;
     while query(service)?.dwCurrentState != SERVICE_STOPPED {
         if Instant::now() > deadline {
-            return Err(format!("the {SERVICE} service did not stop"));
+            return Err(match refused {
+                Some(code) => win::error(&format!("cannot stop the {SERVICE} service"), code),
+                None => format!("the {SERVICE} service did not stop"),
+            });
         }
         std::thread::sleep(Duration::from_millis(100));
     }
