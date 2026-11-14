@@ -649,9 +649,14 @@ fn forgetting_the_publisher_or_changing_the_certificate_authority_updates_the_tr
         .is_none());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn openssl(dir: &Path, args: &[&str]) {
-    let output = std::process::Command::new("/usr/bin/openssl")
+    let program = if cfg!(windows) {
+        "openssl"
+    } else {
+        "/usr/bin/openssl"
+    };
+    let output = std::process::Command::new(program)
         .args(args)
         .current_dir(dir)
         .output()
@@ -663,7 +668,7 @@ fn openssl(dir: &Path, args: &[&str]) {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn throwaway_ca(dir: &Path) -> Vec<u8> {
     std::fs::write(
         dir.join("ca.cnf"),
@@ -874,5 +879,120 @@ fn the_installed_helper_trusts_a_cartridge_certificate_authority_while_it_is_ins
     assert!(anchors().is_empty());
     assert!(placed.iter().all(|path| !Path::new(path).exists()));
     assert!(!verifies(&dir, "inside", "cabinet-test.invalid"));
+    outcome.unwrap();
+}
+
+#[cfg(windows)]
+fn verifies_in(store: &catrust::UserStore, dir: &Path, leaf: &str, name: &str) -> bool {
+    use windows_sys::Win32::Security::Cryptography::*;
+    let pem = std::fs::read(dir.join(format!("{leaf}.pem"))).unwrap();
+    let der = cabinet_cartridge::ca::der(&pem).unwrap();
+    let roots = store.open().unwrap();
+    unsafe {
+        let leaf = CertCreateCertificateContext(X509_ASN_ENCODING, der.as_ptr(), der.len() as u32);
+        assert!(!leaf.is_null());
+        let config = CERT_CHAIN_ENGINE_CONFIG {
+            cbSize: std::mem::size_of::<CERT_CHAIN_ENGINE_CONFIG>() as u32,
+            hExclusiveRoot: roots.0,
+            ..std::mem::zeroed()
+        };
+        let mut engine = std::ptr::null_mut();
+        assert_ne!(CertCreateCertificateChainEngine(&config, &mut engine), 0);
+        let para = CERT_CHAIN_PARA {
+            cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as u32,
+            ..std::mem::zeroed()
+        };
+        let mut chain = std::ptr::null_mut();
+        let built = CertGetCertificateChain(
+            engine,
+            leaf,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &para,
+            0,
+            std::ptr::null(),
+            &mut chain,
+        );
+        assert_ne!(built, 0);
+        let mut server = cabinet_helper::win::wide(name);
+        let mut https = HTTPSPolicyCallbackData {
+            Anonymous: HTTPSPolicyCallbackData_0 {
+                cbStruct: std::mem::size_of::<HTTPSPolicyCallbackData>() as u32,
+            },
+            dwAuthType: AUTHTYPE_SERVER,
+            fdwChecks: 0,
+            pwszServerName: server.as_mut_ptr(),
+        };
+        let policy = CERT_CHAIN_POLICY_PARA {
+            cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as u32,
+            dwFlags: 0,
+            pvExtraPolicyPara: (&mut https as *mut HTTPSPolicyCallbackData).cast(),
+        };
+        let mut status = CERT_CHAIN_POLICY_STATUS {
+            cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_STATUS>() as u32,
+            ..std::mem::zeroed()
+        };
+        let checked =
+            CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain, &policy, &mut status);
+        let errors = (*chain).TrustStatus.dwErrorStatus;
+        CertFreeCertificateChain(chain);
+        CertFreeCertificateChainEngine(engine);
+        CertFreeCertificateContext(leaf);
+        checked != 0 && status.dwError == 0 && errors == CERT_TRUST_NO_ERROR
+    }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "trusts a throwaway certificate authority in a test store of this user's certificates"]
+fn the_user_store_trusts_a_cartridge_certificate_authority_while_it_is_installed() {
+    let trust = catrust::UserStore(format!("TheCabinetTest{}", std::process::id()));
+    let mut fixture = Fixture::new("ca-live");
+    let dir = fixture.scratch.path("ca");
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca = throwaway_ca(&dir);
+    fixture.now = crate::time::now_ms();
+    assert!(!verifies_in(&trust, &dir, "inside", "cabinet-test.invalid"));
+
+    let signer = signer();
+    let cart = ca_cart(&fixture, &signer, "0.1.0", ONE_NAME, &ca);
+    let installed = Installer {
+        store: &mut fixture.store,
+        cabinet: Version::new(0, 1, 15),
+        platform: Platform::current().unwrap(),
+        fetch: &fixture.fetch,
+        log_dir: fixture.scratch.path("logs"),
+        now: fixture.now,
+        busy: false,
+        trust: Some(&trust),
+    }
+    .install(&cart, None, &trusting("Friend"))
+    .unwrap();
+    assert_eq!(installed.ca_problem, None);
+    let recorded = fixture
+        .store
+        .entry(&installed.cartridge)
+        .unwrap()
+        .trusted_ca
+        .clone()
+        .unwrap();
+    let outcome = std::panic::catch_unwind(|| {
+        assert!(trust.holds(&recorded.sha256).unwrap());
+        assert!(verifies_in(&trust, &dir, "inside", "cabinet-test.invalid"));
+        assert!(!verifies_in(&trust, &dir, "outside", "other-test.invalid"));
+        assert!(!verifies_in(&trust, &dir, "inside", "other-test.invalid"));
+    });
+
+    uninstall(
+        &mut fixture.store,
+        &installed.cartridge,
+        Platform::current().unwrap(),
+        &fixture.scratch.path("logs"),
+        None,
+        Some(&trust),
+    )
+    .unwrap();
+    assert!(!trust.holds(&recorded.sha256).unwrap());
+    assert!(!verifies_in(&trust, &dir, "inside", "cabinet-test.invalid"));
     outcome.unwrap();
 }

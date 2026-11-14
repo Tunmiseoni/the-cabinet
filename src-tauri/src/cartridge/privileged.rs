@@ -94,7 +94,7 @@ fn settled(capabilities: &Capabilities) -> Vec<&'static str> {
             items.push("firewall");
         }
     }
-    if cfg!(target_os = "linux")
+    if cfg!(any(target_os = "linux", windows))
         && capabilities
             .trust_ca
             .as_ref()
