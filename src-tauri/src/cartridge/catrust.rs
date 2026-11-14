@@ -455,8 +455,9 @@ fn declined(code: u32) -> bool {
 #[cfg(windows)]
 impl TrustStore for UserStore {
     fn trust(&self, ca: &Ca) -> Result<(), String> {
+        use windows_sys::Win32::Foundation::CRYPT_E_EXISTS;
         use windows_sys::Win32::Security::Cryptography::{
-            CertAddEncodedCertificateToStore, CERT_STORE_ADD_NEW, CRYPT_E_EXISTS, X509_ASN_ENCODING,
+            CertAddEncodedCertificateToStore, CERT_STORE_ADD_NEW, X509_ASN_ENCODING,
         };
         let store = self.open()?;
         let added = unsafe {
