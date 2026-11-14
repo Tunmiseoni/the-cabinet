@@ -126,6 +126,7 @@ jobs:
           if (Test-Path "$env:ProgramData\com.the-cabinet.helper") { throw "the journal folder is still there" }
           if ([System.IO.Directory]::GetFiles("\\.\pipe\") -contains "\\.\pipe\com.the-cabinet.helper") { throw "the pipe is still there" }
           if ((Get-FileHash $hosts).Hash -ne $before) { throw "the hosts file changed" }
+          if (Get-NetFirewallRule -DisplayName 'The Cabinet *' -ErrorAction SilentlyContinue) { throw "a firewall rule is left" }
 
       - name: Build echo-cart
         working-directory: src-tauri
