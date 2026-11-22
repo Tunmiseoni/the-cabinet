@@ -45,7 +45,7 @@ pub fn programs(uid: u32) -> Option<Programs> {
     };
     Some(Programs {
         firewall: None,
-        port_firewall: Some(Box::new(crate::firewall::Ufw)),
+        port_firewall: Some(Box::new(crate::firewall::LinuxPorts)),
         rule_firewall: None,
         low_ports: Some(Box::new(crate::lowports::FileCapability)),
         root: home.join(APP_DATA),

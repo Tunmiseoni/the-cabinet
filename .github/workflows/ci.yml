@@ -94,10 +94,19 @@ jobs:
           cp /etc/hosts "$RUNNER_TEMP/hosts.before"
           sudo target/debug/cabinet-helper install --uid "$(id -u)"
           systemctl is-active com.the-cabinet.helper.service
+          CABINET_EXPECT_FIREWALL=none cargo test --workspace -- --ignored --test-threads=1 the_installed_helper_redirects
           sudo ufw --force enable
-          CABINET_EXPECT_UFW=1 cargo test --workspace -- --ignored --test-threads=1 the_installed_helper_
-          sudo /usr/local/libexec/the-cabinet/com.the-cabinet.helper uninstall
+          CABINET_EXPECT_FIREWALL=ufw cargo test --workspace -- --ignored --test-threads=1 the_installed_helper_
           if sudo ufw status | grep tailscale0; then exit 1; fi
+          sudo ufw --force disable
+          sudo apt-get install -y firewalld
+          sudo systemctl enable --now firewalld
+          test "$(sudo firewall-cmd --state)" = running
+          sudo ufw status | grep -x 'Status: inactive'
+          CABINET_EXPECT_FIREWALL=firewalld cargo test --workspace -- --ignored --test-threads=1 the_installed_helper_redirects
+          if sudo firewall-cmd --list-all-zones | grep 100.64.0.0/10; then exit 1; fi
+          sudo systemctl disable --now firewalld
+          sudo /usr/local/libexec/the-cabinet/com.the-cabinet.helper uninstall
           if ls /usr/local/share/ca-certificates/the-cabinet-* 2>/dev/null; then exit 1; fi
           diff "$RUNNER_TEMP/hosts.before" /etc/hosts
           test ! -e /etc/systemd/system/com.the-cabinet.helper.service

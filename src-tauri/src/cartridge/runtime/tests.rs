@@ -868,34 +868,62 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let expect_ufw = std::env::var_os("CABINET_EXPECT_UFW").is_some();
+    let expect_firewall = std::env::var("CABINET_EXPECT_FIREWALL").ok();
     let tcp_987 = cabinet_helper::protocol::Port {
         proto: cabinet_helper::protocol::Proto::Tcp,
         port: 987,
     };
-    let ufw_allows_987 = || {
-        let output = std::process::Command::new("sudo")
-            .args(["-n", "ufw", "status"])
-            .output()
-            .unwrap();
-        let status = String::from_utf8_lossy(&output.stdout).into_owned();
-        (
-            cabinet_helper::firewall::ufw_allows(&status, &tcp_987),
-            status,
-        )
+    let allows_987 = |firewall: &str| {
+        let run = |args: &[String]| {
+            let output = std::process::Command::new("sudo")
+                .arg("-n")
+                .arg(if firewall == "ufw" {
+                    "ufw"
+                } else {
+                    "firewall-cmd"
+                })
+                .args(args)
+                .output()
+                .map_err(|err| err.to_string())?;
+            Ok((
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            ))
+        };
+        if firewall == "ufw" {
+            let (_, status) = run(&["status".to_string()]).unwrap();
+            return (
+                cabinet_helper::firewall::ufw_allows(&status, &tcp_987),
+                status,
+            );
+        }
+        let zone = cabinet_helper::firewall::firewalld_zone(&run).unwrap();
+        let held = cabinet_helper::firewall::firewalld_holds(&run, &zone, &tcp_987).unwrap();
+        let (_, rules) = run(&[format!("--zone={zone}"), "--list-rich-rules".to_string()]).unwrap();
+        (held, format!("zone {zone}: {rules}"))
     };
-    if expect_ufw {
+    if let Some(firewall) = expect_firewall.as_deref() {
         let entries = cabinet_helper::client::Client::connect(&system.socket)
             .unwrap()
             .status()
             .unwrap();
-        assert!(
-            entries.iter().any(|entry| matches!(&entry.change,
-                cabinet_helper::protocol::Change::Firewall { opened, .. } if opened == &vec![tcp_987.clone()])),
-            "{entries:?}"
-        );
-        let (allowed, status) = ufw_allows_987();
-        assert!(allowed, "{status}");
+        let opened: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match &entry.change {
+                cabinet_helper::protocol::Change::Firewall { opened, .. } => Some(opened.clone()),
+                _ => None,
+            })
+            .collect();
+        if firewall == "none" {
+            assert!(
+                !opened.is_empty() && opened.iter().all(Vec::is_empty),
+                "{entries:?}"
+            );
+        } else {
+            assert!(opened.contains(&vec![tcp_987.clone()]), "{entries:?}");
+            let (allowed, status) = allows_987(firewall);
+            assert!(allowed, "{status}");
+        }
     }
     block_on(member.stop());
     assert_eq!(system.redirects(), 1, "{}", system.hosts());
@@ -910,8 +938,11 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
         Ok(false),
         "the service program kept its low-port right after the session"
     );
-    if expect_ufw {
-        let (allowed, status) = ufw_allows_987();
+    if let Some(firewall) = expect_firewall
+        .as_deref()
+        .filter(|firewall| *firewall != "none")
+    {
+        let (allowed, status) = allows_987(firewall);
         assert!(!allowed, "{status}");
     }
     assert!(cabinet_helper::client::Client::connect(&system.socket)
