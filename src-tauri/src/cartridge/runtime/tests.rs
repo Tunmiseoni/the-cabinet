@@ -791,6 +791,13 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
             .map(|mut found| found.any(|address| address.ip() == Ipv4Addr::LOCALHOST))
             .unwrap_or(false)
     };
+    let resolves_eventually = |wanted: bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while resolves_to_loopback() != wanted && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        resolves_to_loopback() == wanted
+    };
     assert!(
         !resolves_to_loopback(),
         "the test name resolves before the session"
@@ -830,7 +837,7 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
     });
     assert_eq!(system.redirects(), 2, "{}", system.hosts());
     assert!(
-        resolves_to_loopback(),
+        resolves_eventually(true),
         "the test name does not resolve during the session"
     );
     let granted_program = cabinet_helper::client::Client::connect(&system.socket)
@@ -930,7 +937,7 @@ fn the_installed_helper_redirects_the_test_name_for_a_session() {
     block_on(host.stop());
     assert_eq!(system.hosts(), before);
     assert!(
-        !resolves_to_loopback(),
+        resolves_eventually(false),
         "the test name still resolves after the session"
     );
     assert_eq!(
