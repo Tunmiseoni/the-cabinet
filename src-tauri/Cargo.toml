@@ -18,6 +18,13 @@ members = ["cartridge", "helper", "../cartridges/test"]
 name = "the_cabinet_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+friend-kit = []
+
+[[example]]
+name = "friend-kit"
+required-features = ["friend-kit"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

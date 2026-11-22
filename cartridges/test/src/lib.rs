@@ -22,6 +22,12 @@ pub fn run(args: &[String], input: impl BufRead, output: impl Write) -> i32 {
                 _ => 14,
             }
         }
+        Some("listen") => {
+            return match args.get(1).and_then(|port| port.parse().ok()) {
+                Some(port) => listen(port),
+                None => 15,
+            }
+        }
         _ => {}
     }
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
@@ -79,6 +85,19 @@ pub fn bind_only(port: u16) -> std::io::Result<socket2::Socket> {
     let address = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
     socket.bind(&address.into())?;
     Ok(socket)
+}
+
+pub const BANNER: &str = "echo-cart\n";
+
+fn listen(port: u16) -> i32 {
+    let listener = match std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)) {
+        Ok(listener) => listener,
+        Err(_) => return 14,
+    };
+    for mut stream in listener.incoming().flatten() {
+        let _ = stream.write_all(BANNER.as_bytes());
+    }
+    0
 }
 
 fn service(

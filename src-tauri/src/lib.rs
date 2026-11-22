@@ -6,6 +6,8 @@ mod contracts;
 mod diagnostics;
 mod env;
 pub mod error;
+#[cfg(feature = "friend-kit")]
+pub mod kit;
 mod lobby;
 mod logging;
 mod net;

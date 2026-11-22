@@ -99,6 +99,37 @@ pub fn ufw_rule(verb: &[&str], port: &Port) -> Vec<String> {
     args
 }
 
+pub fn rich_rule(port: &Port) -> String {
+    format!(
+        "rule family=\"ipv4\" source address=\"{TAILNET_RANGE}\" port port=\"{}\" protocol=\"{}\" accept",
+        port.port,
+        proto(&port.proto)
+    )
+}
+
+pub type Run<'a> = &'a dyn Fn(&[String]) -> Result<(bool, String), String>;
+
+pub fn firewalld_zone(run: Run) -> Result<String, String> {
+    let (bound, zone) = run(&[format!("--get-zone-of-interface={TAILNET_INTERFACE}")])?;
+    if bound && !zone.trim().is_empty() {
+        return Ok(zone.trim().to_string());
+    }
+    let (found, zone) = run(&["--get-default-zone".to_string()])?;
+    if found && !zone.trim().is_empty() {
+        Ok(zone.trim().to_string())
+    } else {
+        Err(format!("firewalld has no default zone: {}", zone.trim()))
+    }
+}
+
+pub fn firewalld_holds(run: Run, zone: &str, port: &Port) -> Result<bool, String> {
+    Ok(run(&[
+        format!("--zone={zone}"),
+        format!("--query-rich-rule={}", rich_rule(port)),
+    ])?
+    .0)
+}
+
 pub fn rule_name(id: &str) -> String {
     format!("{UFW_COMMENT} {id}")
 }
@@ -305,82 +336,159 @@ impl AppFirewall for SocketFilter {
 }
 
 #[cfg(target_os = "linux")]
-pub struct Ufw;
+pub struct LinuxPorts;
 
 #[cfg(target_os = "linux")]
-impl Ufw {
-    const TOOLS: &'static [&'static str] = &["/usr/sbin/ufw", "/usr/bin/ufw", "/sbin/ufw"];
+enum Active {
+    Ufw(&'static str),
+    Firewalld(&'static str),
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPorts {
+    const UFW: &'static [&'static str] = &["/usr/sbin/ufw", "/usr/bin/ufw", "/sbin/ufw"];
     const FIREWALLD: &'static [&'static str] = &["/usr/bin/firewall-cmd", "/bin/firewall-cmd"];
 
     fn find(paths: &[&'static str]) -> Option<&'static str> {
         paths.iter().copied().find(|path| Path::new(path).exists())
     }
 
-    fn run(tool: &str, args: &[String]) -> Result<String, String> {
+    fn call(tool: &str, args: &[String]) -> Result<(bool, String), String> {
         let output = std::process::Command::new(tool)
             .args(args)
             .output()
             .map_err(|err| format!("cannot run {tool}: {err}"))?;
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
         if output.status.success() {
-            Ok(text)
+            Ok((true, text))
         } else {
-            Err(format!(
-                "{tool} {} failed: {} {}",
-                args.join(" "),
-                text.trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
+            Ok((
+                false,
+                format!(
+                    "{} {}",
+                    text.trim(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
             ))
         }
     }
 
-    fn status(tool: &str) -> Result<String, String> {
+    fn run(tool: &str, args: &[String]) -> Result<String, String> {
+        match Self::call(tool, args)? {
+            (true, text) => Ok(text),
+            (false, text) => Err(format!("{tool} {} failed: {}", args.join(" "), text.trim())),
+        }
+    }
+
+    fn ufw_status(tool: &str) -> Result<String, String> {
         Self::run(tool, &["status".to_string()])
     }
 
-    fn tool() -> Result<&'static str, String> {
-        Self::find(Self::TOOLS).ok_or_else(|| "ufw is not installed".to_string())
-    }
-
-    fn firewalld_running() -> bool {
-        Self::find(Self::FIREWALLD).is_some_and(|tool| {
+    fn firewalld() -> Option<&'static str> {
+        Self::find(Self::FIREWALLD).filter(|tool| {
             Self::run(tool, &["--state".to_string()]).is_ok_and(|state| state.trim() == "running")
         })
+    }
+
+    fn active() -> Result<Option<Active>, String> {
+        if let Some(tool) = Self::find(Self::UFW) {
+            if ufw_active(&Self::ufw_status(tool)?) {
+                return Ok(Some(Active::Ufw(tool)));
+            }
+        }
+        Ok(Self::firewalld().map(Active::Firewalld))
+    }
+
+    fn firewalld_run(tool: &'static str) -> impl Fn(&[String]) -> Result<(bool, String), String> {
+        move |args| Self::call(tool, args)
+    }
+
+    fn rich(tool: &'static str, verb: &str, port: &Port) -> Result<String, String> {
+        let run = Self::firewalld_run(tool);
+        let zone = firewalld_zone(&run)?;
+        Self::run(
+            tool,
+            &[
+                format!("--zone={zone}"),
+                format!("--{verb}-rich-rule={}", rich_rule(port)),
+            ],
+        )?;
+        Ok(zone)
     }
 }
 
 #[cfg(target_os = "linux")]
-impl PortFirewall for Ufw {
+impl PortFirewall for LinuxPorts {
     fn enabled(&self) -> Result<bool, String> {
-        if let Some(tool) = Self::find(Self::TOOLS) {
-            if ufw_active(&Self::status(tool)?) {
-                return Ok(true);
-            }
-        }
-        if Self::firewalld_running() {
-            return Err(
-                "firewalld is running, and The Cabinet cannot open ports in it yet".to_string(),
-            );
-        }
-        Ok(false)
+        Ok(Self::active()?.is_some())
     }
 
     fn is_open(&self, port: &Port) -> Result<bool, String> {
-        Ok(ufw_allows(&Self::status(Self::tool()?)?, port))
+        match Self::active()? {
+            Some(Active::Ufw(tool)) => Ok(ufw_allows(&Self::ufw_status(tool)?, port)),
+            Some(Active::Firewalld(tool)) => {
+                let run = Self::firewalld_run(tool);
+                let zone = firewalld_zone(&run)?;
+                Ok(firewalld_holds(&run, &zone, port)?
+                    || run(&[
+                        format!("--zone={zone}"),
+                        format!("--query-port={}/{}", port.port, proto(&port.proto)),
+                    ])?
+                    .0)
+            }
+            None => Ok(false),
+        }
     }
 
     fn open(&self, port: &Port) -> Result<(), String> {
-        let tool = Self::tool()?;
-        Self::run(tool, &ufw_rule(&[], port))?;
-        if self.is_open(port)? {
-            Ok(())
-        } else {
-            Err(format!("ufw did not open port {}", port.port))
+        match Self::active()? {
+            Some(Active::Ufw(tool)) => {
+                Self::run(tool, &ufw_rule(&[], port))?;
+                if ufw_allows(&Self::ufw_status(tool)?, port) {
+                    Ok(())
+                } else {
+                    Err(format!("ufw did not open port {}", port.port))
+                }
+            }
+            Some(Active::Firewalld(tool)) => {
+                let zone = Self::rich(tool, "add", port)?;
+                if firewalld_holds(&Self::firewalld_run(tool), &zone, port)? {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "firewalld did not open port {} in the zone {zone}",
+                        port.port
+                    ))
+                }
+            }
+            None => Err("no firewall is active any more".to_string()),
         }
     }
 
     fn close(&self, port: &Port) -> Result<(), String> {
-        Self::run(Self::tool()?, &ufw_rule(&["delete"], port)).map(|_| ())
+        match Self::active()? {
+            Some(Active::Firewalld(tool)) => {
+                let run = Self::firewalld_run(tool);
+                let zone = firewalld_zone(&run)?;
+                if !firewalld_holds(&run, &zone, port)? {
+                    return Ok(());
+                }
+                Self::rich(tool, "remove", port)?;
+                if firewalld_holds(&run, &zone, port)? {
+                    Err(format!(
+                        "firewalld kept port {} open in the zone {zone}",
+                        port.port
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Some(Active::Ufw(tool)) => Self::run(tool, &ufw_rule(&["delete"], port)).map(|_| ()),
+            None => match Self::find(Self::UFW) {
+                Some(tool) => Self::run(tool, &ufw_rule(&["delete"], port)).map(|_| ()),
+                None => Ok(()),
+            },
+        }
     }
 }
 
@@ -622,6 +730,47 @@ To                         Action      From
             ufw_rule(&["delete"], &tcp(987)).join(" "),
             "delete allow in on tailscale0 to any port 987 proto tcp comment The Cabinet"
         );
+    }
+
+    #[test]
+    fn a_firewalld_rule_admits_the_tailnet_on_one_port_in_the_tailnet_zone() {
+        assert_eq!(
+            rich_rule(&Port {
+                proto: Proto::Udp,
+                port: 3074
+            }),
+            "rule family=\"ipv4\" source address=\"100.64.0.0/10\" port port=\"3074\" protocol=\"udp\" accept"
+        );
+        let asked = Mutex::new(Vec::new());
+        let bound = |args: &[String]| {
+            asked.lock().unwrap().push(args.join(" "));
+            Ok(match args[0].as_str() {
+                "--get-zone-of-interface=tailscale0" => (true, "trusted\n".to_string()),
+                _ => (true, "public\n".to_string()),
+            })
+        };
+        assert_eq!(firewalld_zone(&bound).unwrap(), "trusted");
+        let unbound = |args: &[String]| {
+            Ok(match args[0].as_str() {
+                "--get-zone-of-interface=tailscale0" => (false, "no zone".to_string()),
+                _ => (true, "public\n".to_string()),
+            })
+        };
+        assert_eq!(firewalld_zone(&unbound).unwrap(), "public");
+        let broken = |_: &[String]| Ok((false, String::new()));
+        assert!(firewalld_zone(&broken).is_err());
+        let held = |args: &[String]| {
+            Ok((
+                args == [
+                    "--zone=public".to_string(),
+                    format!("--query-rich-rule={}", rich_rule(&tcp(987))),
+                ],
+                String::new(),
+            ))
+        };
+        assert!(firewalld_holds(&held, "public", &tcp(987)).unwrap());
+        assert!(!firewalld_holds(&held, "public", &tcp(988)).unwrap());
+        assert!(!firewalld_holds(&held, "trusted", &tcp(987)).unwrap());
     }
 
     #[test]

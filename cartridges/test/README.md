@@ -24,6 +24,7 @@ A cartridge that exercises the whole cartridge contract and plays no game. It is
 | `echo-cart --service` | `ready`, then waits for `stop` |
 | `echo-cart --service --bind <port>` | also binds `<port>` on the wildcard address (without listening) until it stops, and logs whether that worked |
 | `echo-cart --fail` | reports a fatal `error` and exits 3 |
+| `echo-cart listen <port>` | accepts TCP connections on `<port>` on the wildcard address and answers each with `echo-cart`, until killed (the friend kit's reachability check) |
 | `echo-cart setup <file>` | writes `<file>` |
 | `echo-cart uninstall` | exits 0 |
 
